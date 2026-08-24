@@ -167,6 +167,35 @@ def calcular_comision_estimada(cumplimiento_pct: float) -> float:
     return comision
 
 
+# ---------------------------------------------------------------------------
+# RANGOS DE CUMPLIMIENTO (para el filtro "Rango de Cumplimiento" en Vista Gerencial)
+# ---------------------------------------------------------------------------
+RANGOS_CUMPLIMIENTO = [
+    "PDV no activo (0 ventas)",
+    "0.01% – 80%",
+    "80.01% – 90%",
+    "90.01% – 95%",
+    "95.01% – 100%",
+    "Más de 100%",
+]
+
+
+def clasificar_rango_cumplimiento(cumplimiento: float) -> str:
+    """Clasifica un % de cumplimiento (fracción, ej 0.85) en uno de los
+    RANGOS_CUMPLIMIENTO. cumplimiento <= 0 se considera 'PDV no activo'."""
+    if cumplimiento <= 0:
+        return "PDV no activo (0 ventas)"
+    if cumplimiento <= 0.80:
+        return "0.01% – 80%"
+    if cumplimiento <= 0.90:
+        return "80.01% – 90%"
+    if cumplimiento <= 0.95:
+        return "90.01% – 95%"
+    if cumplimiento <= 1.00:
+        return "95.01% – 100%"
+    return "Más de 100%"
+
+
 # Columnas obligatorias en el Excel. A diferencia de la versión anterior,
 # PDV y Nombre PDV YA NO son opcionales: todo Gestor tiene al menos un PDV.
 COLUMNAS_REQUERIDAS = {
@@ -1208,8 +1237,27 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
 
     tabla = construir_tabla_producto(df_filtrado, agrupar_por, desagrupar, productos_sel, dias_en_mes, dia_corte)
     orden_prod_sel = [p for p in PRODUCTOS if p in productos_sel]
+
+    # --- Filtro por Rango de Cumplimiento (calculado sobre el total de la fila,
+    # sumando todos los productos seleccionados) ---
+    rango_sel = st.multiselect(
+        "Filtrar por Rango de Cumplimiento (opcional)",
+        options=RANGOS_CUMPLIMIENTO, default=[], key="rango_cumplimiento_gerencial",
+    )
+    if rango_sel:
+        cols_avance = [(p, "Avance") for p in orden_prod_sel if (p, "Avance") in tabla.columns]
+        cols_cuota = [(p, "Cuota") for p in orden_prod_sel if (p, "Cuota") in tabla.columns]
+        avance_fila = tabla[cols_avance].sum(axis=1)
+        cuota_fila = tabla[cols_cuota].sum(axis=1)
+        cumplimiento_fila = np.where(cuota_fila > 0, avance_fila / cuota_fila, 0.0)
+        rango_fila = pd.Series(cumplimiento_fila, index=tabla.index).map(clasificar_rango_cumplimiento)
+        tabla = tabla[rango_fila.isin(rango_sel)]
+
     altura = 480 if desagrupar else "content"
-    st.dataframe(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), width="stretch", height=altura)
+    if tabla.empty:
+        st.info("No hay filas para el Rango de Cumplimiento seleccionado.")
+    else:
+        st.dataframe(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), width="stretch", height=altura)
     st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Cumplimiento % y Proy %)")
 
     tabla_csv = tabla.copy()
