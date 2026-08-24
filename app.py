@@ -1055,23 +1055,41 @@ def vista_gestor(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, dias_restan
     st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100%")
 
 
+def aplicar_estilo_detalle_plano(tabla: pd.DataFrame):
+    """Formato numérico + semáforo para una tabla plana (no pivote) con
+    columnas Cuota, Avance, Cumplimiento %, Proy Unidades. Se usa para el
+    detalle de PDV desagregado a nivel Departamento en Vista Gerencial."""
+    fmt = {}
+    for col, patron in (("Cuota", "{:,.0f}"), ("Avance", "{:,.0f}"),
+                        ("Cumplimiento %", "{:.1%}"), ("Proy Unidades", "{:,.0f}")):
+        if col in tabla.columns:
+            fmt[col] = patron
+    styler = tabla.style.format(fmt)
+    columnas_semaforo = [c for c in ["Cumplimiento %"] if c in tabla.columns]
+    return _aplicar_semaforo(styler, columnas_semaforo)
+
+
 def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
-    """Pestaña 'Vista Gerencial': todos los gestores, sin filtro individual."""
+    """Pestaña 'Vista Gerencial'. El selector de Departamento tiene una
+    opción "Fanero (Total)" que agrega TODOS los departamentos (el detalle
+    por Departamento y el ranking de TODOS los gestores siguen visibles
+    debajo, sumando al total). Si se elige un Departamento específico, se
+    habilita "Desagrupar" para ver el detalle de sus PDV."""
     col_dep, col_prod = st.columns(2)
+
+    departamentos_disponibles = sorted(df["Departamento"].unique())
+    opciones_depto = ["Fanero (Total)"] + departamentos_disponibles
     with col_dep:
-        departamentos_sel = st.multiselect(
-            "Departamento", options=sorted(df["Departamento"].unique()),
-            default=sorted(df["Departamento"].unique()), key="depto_gerencial",
-        )
+        depto_sel = st.selectbox("Departamento", opciones_depto, key="depto_gerencial")
     with col_prod:
         productos_sel = st.multiselect(
             "Producto", options=PRODUCTOS, default=PRODUCTOS, key="producto_gerencial",
         )
-
-    if not departamentos_sel:
-        departamentos_sel = sorted(df["Departamento"].unique())
     if not productos_sel:
         productos_sel = PRODUCTOS
+
+    es_total_fanero = depto_sel == "Fanero (Total)"
+    departamentos_sel = departamentos_disponibles if es_total_fanero else [depto_sel]
 
     df_filtrado = df[df["Departamento"].isin(departamentos_sel) & df["Producto"].isin(productos_sel)]
 
@@ -1079,7 +1097,7 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
         st.info("No hay datos para los filtros seleccionados.")
         return
 
-    # --- KPIs generales ---
+    # --- KPIs generales (Fanero total, o solo el departamento elegido) ---
     cuota_total = df_filtrado["Cuota"].sum()
     avance_total = df_filtrado["Avance"].sum()
     cumplimiento = (avance_total / cuota_total) if cuota_total > 0 else 0.0
@@ -1102,14 +1120,43 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
     col6.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
 
     st.markdown("---")
-    st.markdown("#### Resumen por Producto (por Departamento)")
+    if es_total_fanero:
+        st.markdown("#### Resumen por Producto (todos los Departamentos)")
+    else:
+        st.markdown(f"#### Resumen por Producto · {depto_sel}")
+    # El detalle por Departamento SIEMPRE se calcula sobre todos los
+    # departamentos disponibles cuando se elige "Fanero (Total)", para que
+    # cada fila (departamento) muestre su propio avance/proyección y sumen
+    # el total de arriba. Si se eligió un departamento puntual, la tabla
+    # queda con esa única fila.
     tabla_resumen = resumen_por_producto(df_filtrado, departamentos_sel, productos_sel, dias_en_mes, dia_corte)
     orden_prod_sel = [p for p in PRODUCTOS if p in productos_sel]
     st.dataframe(aplicar_estilo_resumen_producto(tabla_resumen, orden_prod_sel), width="stretch")
     st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Cumplimiento % y Proy %)")
 
+    if not es_total_fanero:
+        with st.expander(f"➕ Desagrupar: ver detalle por PDV en {depto_sel}"):
+            detalle_depto = detalle_pdv_gestor(df_filtrado, dias_en_mes, dia_corte)
+            detalle_depto = detalle_depto.rename(columns={"DNI": "DNI Gestor", "Nombre": "Nombre Gestor"})
+            columnas_orden = [
+                "DNI Gestor", "Nombre Gestor", "Departamento", "Provincia", "Distrito",
+                "Producto", "PDV", "Nombre PDV", "Cuota", "Avance", "Cumplimiento %", "Proy Unidades",
+            ]
+            detalle_depto = detalle_depto[columnas_orden].sort_values(["Nombre Gestor", "Producto", "PDV"])
+            st.dataframe(aplicar_estilo_detalle_plano(detalle_depto), width="stretch", height=420)
+            st.download_button(
+                "⬇️ Descargar detalle de PDV (CSV)",
+                data=detalle_depto.to_csv(index=False).encode("utf-8"),
+                file_name=f"detalle_pdv_{depto_sel.replace(' ', '_').lower()}.csv",
+                mime="text/csv",
+                key="descargar_detalle_depto",
+            )
+
     st.markdown("---")
-    st.markdown("#### 🏆 Ranking de gestores")
+    if es_total_fanero:
+        st.markdown("#### 🏆 Ranking de gestores (todos — Fanero)")
+    else:
+        st.markdown(f"#### 🏆 Ranking de gestores · {depto_sel}")
     ranking = ranking_gestores(df_filtrado)
     st.dataframe(aplicar_estilo_ranking(ranking), width="stretch", height=420)
 
