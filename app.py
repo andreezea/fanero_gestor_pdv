@@ -124,7 +124,7 @@ DEPARTAMENTOS = list(GEOGRAFIA.keys())
 TODAS_LAS_PROVINCIAS = sorted({prov for deps in GEOGRAFIA.values() for prov in deps.keys()})
 
 # Productos analizados (el orden aquí define el orden de las columnas)
-PRODUCTOS = ["Prepago", "Porta Flex", "Postpago", "OSS"]
+PRODUCTOS = ["Prepago", "Porta Prepago", "Postpago", "OSS"]
 
 # Nombres de referencia para el dataset sintético
 NOMBRES_EJEMPLO = [
@@ -138,6 +138,34 @@ NOMBRES_PDV_EJEMPLO = [
     "Ana Ruiz", "Luis Gómez", "Marco Díaz", "Katia Del Águila",
     "Elmer Torres", "Milagros Chávez", "Sandro Pinedo", "Rosa Vela",
 ]
+
+# ---------------------------------------------------------------------------
+# REGLAS DE COMISIÓN (editar aquí cuando Fanero defina las reglas reales)
+# ---------------------------------------------------------------------------
+# Comisión estimada según el % de Cumplimiento (o Proyección) del gestor.
+# CumplimientoMaximo = None significa "sin límite superior" (el nivel más alto).
+# Estos valores son un placeholder razonable — AJUSTAR con las reglas reales.
+REGLAS_COMISION = [
+    {"CumplimientoMinimo": 0.00, "CumplimientoMaximo": 0.70, "ComisionSoles": 0.0},
+    {"CumplimientoMinimo": 0.70, "CumplimientoMaximo": 0.90, "ComisionSoles": 300.0},
+    {"CumplimientoMinimo": 0.90, "CumplimientoMaximo": 1.00, "ComisionSoles": 600.0},
+    {"CumplimientoMinimo": 1.00, "CumplimientoMaximo": 1.20, "ComisionSoles": 1000.0},
+    {"CumplimientoMinimo": 1.20, "CumplimientoMaximo": None, "ComisionSoles": 1500.0},
+]
+
+
+def calcular_comision_estimada(cumplimiento_pct: float) -> float:
+    """Devuelve la comisión estimada (S/) según el % de cumplimiento/proyección,
+    usando la tabla de niveles REGLAS_COMISION."""
+    comision = 0.0
+    for nivel in REGLAS_COMISION:
+        minimo = nivel["CumplimientoMinimo"]
+        maximo = nivel["CumplimientoMaximo"]
+        dentro = cumplimiento_pct >= minimo and (maximo is None or cumplimiento_pct < maximo)
+        if dentro or cumplimiento_pct >= minimo:
+            comision = nivel["ComisionSoles"]
+    return comision
+
 
 # Columnas obligatorias en el Excel. A diferencia de la versión anterior,
 # PDV y Nombre PDV YA NO son opcionales: todo Gestor tiene al menos un PDV.
@@ -258,13 +286,62 @@ def obtener_datos_publicados() -> tuple[pd.DataFrame, int, int, int]:
 
 def publicar_datos(df: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> None:
     """Guarda el archivo validado y sus metadatos como la fuente de datos
-    oficial del dashboard. Reemplaza por completo lo publicado anteriormente."""
+    oficial del dashboard. Reemplaza por completo lo publicado anteriormente.
+    Es la función de bajo nivel — para la carga normal del admin usar
+    `publicar_datos_incremental`, que sí acumula día a día."""
     os.makedirs(DATA_DIR, exist_ok=True)
     df = _normalizar_identidad(df)
     df.to_excel(DATA_FILE, index=False)
     with open(DATA_META, "w", encoding="utf-8") as f:
         json.dump({"dia_corte": dia_corte, "mes": mes, "anio": anio}, f)
     _leer_excel_publicado.clear()  # invalida el cache de lectura
+
+
+def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> None:
+    """Publica una carga SUMANDO el Avance nuevo al acumulado ya publicado
+    del mismo Mes/Año (en vez de reemplazarlo). Así el administrador puede
+    subir solo lo vendido en el día/periodo más reciente, y la app se
+    encarga de mantener el acumulado del mes.
+
+    Reglas:
+    - DNI + PDV + Producto ya existentes este mes → Avance se SUMA;
+      Cuota se actualiza con el valor del archivo nuevo (no se suma, es la
+      meta del mes, no una venta).
+    - DNI + PDV + Producto nuevos (PDV que se agrega a mitad de mes) → se
+      agregan con su Avance tal como vienen en el archivo.
+    - Si el Mes/Año de la carga es distinto al que había publicado (mes
+      nuevo) → se empieza de cero, igual que `publicar_datos`.
+    """
+    df_nuevo = _normalizar_identidad(df_nuevo)
+
+    hay_publicacion_previa = os.path.exists(DATA_FILE)
+    mismo_periodo = False
+    if hay_publicacion_previa:
+        df_actual, _, mes_actual, anio_actual = obtener_datos_publicados()
+        mismo_periodo = (int(mes_actual) == int(mes)) and (int(anio_actual) == int(anio))
+
+    if not mismo_periodo:
+        # Primera carga del mes (o primera carga de todas): no hay nada que sumar.
+        publicar_datos(df_nuevo, dia_corte, mes, anio)
+        return
+
+    claves = ["DNI", "PDV", "Producto"]
+    df_actual = _normalizar_identidad(df_actual)
+    base = df_actual.set_index(claves)
+    nuevo = df_nuevo.set_index(claves)
+
+    claves_comunes = base.index.intersection(nuevo.index)
+    base.loc[claves_comunes, "Avance"] = (
+        base.loc[claves_comunes, "Avance"] + nuevo.loc[claves_comunes, "Avance"]
+    )
+    if "Cuota" in nuevo.columns:
+        base.loc[claves_comunes, "Cuota"] = nuevo.loc[claves_comunes, "Cuota"]
+
+    claves_nuevas = nuevo.index.difference(base.index)
+    filas_nuevas = nuevo.loc[claves_nuevas]
+
+    combinado = pd.concat([base, filas_nuevas]).reset_index()
+    publicar_datos(combinado, dia_corte, mes, anio)
 
 
 def calcular_metricas(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> pd.DataFrame:
@@ -373,6 +450,7 @@ def ranking_gestores(df_filtrado: pd.DataFrame) -> pd.DataFrame:
         )
     )
     ranking["Cumplimiento %"] = np.where(ranking["Cuota"] > 0, ranking["Avance"] / ranking["Cuota"], 0.0)
+    ranking = ranking.rename(columns={"DNI": "DNI Gestor", "Nombre": "Nombre Gestor"})
     return ranking.sort_values("Avance", ascending=False).reset_index(drop=True)
 
 
@@ -443,6 +521,35 @@ def aplicar_estilo_detalle_pdv(tabla: pd.DataFrame, orden_prod: list):
     return _aplicar_semaforo(styler, subset)
 
 
+def resumen_producto_gestor(df_gestor: pd.DataFrame, productos_sel: list,
+                             dias_en_mes: int, dia_corte: int) -> pd.DataFrame:
+    """Vista PRINCIPAL de un gestor: una fila por Producto, agregando TODOS
+    sus PDV (Cuota, Avance, Cumplimiento %, Proy Unidades, Proy %). Es el
+    resumen que se ve primero; el detalle por PDV queda como desagregado
+    opcional (ver tabla_detalle_gestor / ritmo_pdv_gestor)."""
+    agregado = (
+        df_gestor.groupby("Producto", as_index=False)
+        .agg(Cuota=("Cuota", "sum"), Avance=("Avance", "sum"))
+    )
+    orden_prod = [p for p in PRODUCTOS if p in productos_sel]
+    agregado = agregado.set_index("Producto").reindex(orden_prod).reset_index()
+    agregado[["Cuota", "Avance"]] = agregado[["Cuota", "Avance"]].fillna(0)
+
+    agregado["Cumplimiento %"] = np.where(agregado["Cuota"] > 0, agregado["Avance"] / agregado["Cuota"], 0.0)
+    factor_proyeccion = dias_en_mes / max(dia_corte, 1)
+    agregado["Proy Unidades"] = agregado["Avance"] * factor_proyeccion
+    agregado["Proy %"] = np.where(agregado["Cuota"] > 0, agregado["Proy Unidades"] / agregado["Cuota"], 0.0)
+
+    return agregado.set_index("Producto")
+
+
+def aplicar_estilo_resumen_gestor(tabla: pd.DataFrame):
+    fmt = {"Cuota": "{:,.0f}", "Avance": "{:,.0f}", "Cumplimiento %": "{:.1%}",
+           "Proy Unidades": "{:,.0f}", "Proy %": "{:.1%}"}
+    styler = tabla.style.format(fmt, na_rep="-")
+    return _aplicar_semaforo(styler, ["Cumplimiento %", "Proy %"])
+
+
 def ritmo_pdv_gestor(detalle_g: pd.DataFrame, productos_sel: list, dias_restantes: int) -> pd.DataFrame:
     """Igual que tabla_detalle_gestor pero con métricas de ritmo diario: fila
     "Total" (suma de sus PDV) y una fila por cada PDV, con Cuota Diaria,
@@ -493,6 +600,33 @@ def aplicar_estilo_ritmo_gestor(tabla: pd.DataFrame, orden_prod: list):
     styler = tabla.style.format(fmt, na_rep="-")
     subset = [(p, "Cump %") for p in orden_prod]
     return _aplicar_semaforo(styler, subset)
+
+
+def ritmo_producto_gestor(df_gestor: pd.DataFrame, productos_sel: list, dias_restantes: int) -> pd.DataFrame:
+    """Ritmo diario necesario agregado por Producto (todos los PDV juntos) —
+    vista principal; el desagregado por PDV va en ritmo_pdv_gestor."""
+    agregado = (
+        df_gestor.groupby("Producto", as_index=False)
+        .agg(Cuota=("Cuota", "sum"), Avance=("Avance", "sum"))
+    )
+    orden_prod = [p for p in PRODUCTOS if p in productos_sel]
+    agregado = agregado.set_index("Producto").reindex(orden_prod).reset_index()
+    agregado[["Cuota", "Avance"]] = agregado[["Cuota", "Avance"]].fillna(0)
+
+    agregado["Cump %"] = np.where(agregado["Cuota"] > 0, agregado["Avance"] / agregado["Cuota"], 0.0)
+    agregado["Corte"] = agregado["Avance"]
+    if dias_restantes > 0:
+        agregado["Cuota Diaria"] = (agregado["Cuota"] - agregado["Avance"]) / dias_restantes
+    else:
+        agregado["Cuota Diaria"] = np.nan
+
+    return agregado.set_index("Producto")[["Cuota Diaria", "Corte", "Cump %"]]
+
+
+def aplicar_estilo_ritmo_resumen(tabla: pd.DataFrame):
+    fmt = {"Cuota Diaria": "{:,.1f}", "Corte": "{:,.0f}", "Cump %": "{:.1%}"}
+    styler = tabla.style.format(fmt, na_rep="-")
+    return _aplicar_semaforo(styler, ["Cump %"])
 
 
 def ritmo_diario_detalle_pdv(df_filtrado: pd.DataFrame, dias_restantes: int) -> pd.DataFrame:
@@ -556,14 +690,16 @@ def panel_admin() -> None:
         file_name="plantilla_carga_gestores.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    st.caption(
-        "Cuota y Avance ACUMULADO de cada PDV. Cada vez que subas un archivo, "
-        "reemplaza por completo lo publicado -no se suma nada-, así que Avance "
-        "debe ser siempre el total acumulado real hasta la fecha de corte que declares."
+    st.info(
+        "📌 **Cómo funciona la carga:** el Avance que subas se **SUMA automáticamente** "
+        "al acumulado que ya está publicado este mes (no lo reemplaza). Sube solo lo "
+        "vendido en el día o periodo más reciente — la app se encarga de acumularlo. "
+        "Cuota se actualiza con el valor del archivo (no se suma, es la meta del mes). "
+        "Al cambiar de Mes/Año, la app empieza el acumulado de cero automáticamente."
     )
     st.caption(
         "Elimina las filas de ejemplo antes de subir tu archivo real. Cada PDV "
-        "debe tener una fila por producto (Prepago, Porta Flex, Postpago, OSS). "
+        "debe tener una fila por producto (Prepago, Porta Prepago, Postpago, OSS). "
         "PDV = DNI del líder de ese punto de venta; Nombre PDV = su nombre. "
         "DNI y Nombre (columnas iniciales) identifican al Gestor dueño del PDV."
     )
@@ -581,17 +717,29 @@ def panel_admin() -> None:
     dias_en_mes_sel = calendar.monthrange(int(anio_sel), int(mes_sel))[1]
     dia_corte_defecto = min(max(ahora.day - 1, 1), dias_en_mes_sel)
     dia_corte_sel = st.number_input(
-        "Día de corte (último día del mes con ventas cargadas)",
+        "Día de corte (hasta qué día del mes llega el Avance de esta carga)",
         min_value=1, max_value=dias_en_mes_sel, value=dia_corte_defecto,
     )
 
     archivo = st.file_uploader("Cargar archivo Excel (.xlsx)", type=["xlsx"])
 
+    forzar_reemplazo = st.checkbox(
+        "⚠️ Esta carga REEMPLAZA todo lo publicado, en vez de sumarlo "
+        "(úsalo solo para corregir un error de carga)."
+    )
+
     if archivo is not None and st.button("Publicar datos"):
         df_validado = cargar_datos_excel(archivo)
         if df_validado is not None:
-            publicar_datos(df_validado, int(dia_corte_sel), int(mes_sel), int(anio_sel))
-            st.success("Datos publicados. Todos los usuarios verán la actualización al recargar.")
+            if forzar_reemplazo:
+                publicar_datos(df_validado, int(dia_corte_sel), int(mes_sel), int(anio_sel))
+                st.success("Datos publicados: se REEMPLAZÓ todo lo anterior con este archivo.")
+            else:
+                publicar_datos_incremental(df_validado, int(dia_corte_sel), int(mes_sel), int(anio_sel))
+                st.success(
+                    "Datos publicados: el Avance se sumó al acumulado del mes. "
+                    "Todos los usuarios verán la actualización al recargar."
+                )
 
     if os.path.exists(DATA_FILE):
         ultima_actualizacion = datetime.fromtimestamp(os.path.getmtime(DATA_FILE))
@@ -808,24 +956,38 @@ def panel_editar_avances(df_raw: pd.DataFrame) -> None:
 # =============================================================================
 
 def vista_gestor(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, dias_restantes: int) -> None:
-    """Pestaña 'Mi Cartera': el Gestor se busca a sí mismo y ve solo sus PDV."""
-    gestores = df[["DNI", "Nombre"]].drop_duplicates().sort_values("Nombre")
-    opciones = [f"{fila['Nombre']} · DNI {fila['DNI']}" for _, fila in gestores.iterrows()]
+    """Pestaña 'Mi Cartera': primero se elige Departamento, luego el Gestor
+    dentro de ese departamento. Se busca a sí mismo y ve solo sus PDV."""
+    col_depto, col_gestor = st.columns(2)
+
+    with col_depto:
+        departamentos_disp = sorted(df["Departamento"].unique())
+        depto_sel = st.selectbox("Departamento", departamentos_disp, key="depto_gestor")
+
+    df_depto = df[df["Departamento"] == depto_sel]
+    gestores = df_depto[["DNI", "Nombre"]].drop_duplicates().sort_values("Nombre")
+
+    with col_gestor:
+        opciones = [f"{fila['Nombre']} · DNI {fila['DNI']}" for _, fila in gestores.iterrows()]
+        if not opciones:
+            st.info("No hay gestores en este departamento.")
+            return
+        seleccion = st.selectbox("Gestor", opciones, key="gestor_seleccionado")
+
     mapa_opcion_dni = dict(zip(opciones, gestores["DNI"]))
-
-    if not opciones:
-        st.info("No hay gestores disponibles en los datos publicados.")
-        return
-
-    seleccion = st.selectbox("Selecciona tu nombre (Gestor)", opciones, key="gestor_seleccionado")
     dni_sel = mapa_opcion_dni[seleccion]
+    nombre_sel = gestores[gestores["DNI"] == dni_sel]["Nombre"].iloc[0]
+
+    st.markdown(f"**DNI Gestor:** {dni_sel}  ·  **Nombre Gestor:** {nombre_sel}  ·  **Departamento:** {depto_sel}")
 
     productos_sel = st.multiselect("Producto", options=PRODUCTOS, default=PRODUCTOS, key="productos_gestor")
     if not productos_sel:
         productos_sel = PRODUCTOS
     orden_prod_sel = [p for p in PRODUCTOS if p in productos_sel]
 
-    df_gestor = df[(df["DNI"] == dni_sel) & (df["Producto"].isin(productos_sel))]
+    # Nota: se filtra por Departamento + DNI (no solo DNI), porque en teoría un
+    # mismo DNI no debería repetirse en 2 departamentos, pero así queda blindado.
+    df_gestor = df[(df["DNI"] == dni_sel) & (df["Departamento"] == depto_sel) & (df["Producto"].isin(productos_sel))]
     if df_gestor.empty:
         st.info("No hay datos para los productos seleccionados.")
         return
@@ -837,25 +999,32 @@ def vista_gestor(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, dias_restan
     proy_total = avance_total * (dias_en_mes / max(dia_corte, 1))
     proy_pct = (proy_total / cuota_total) if cuota_total > 0 else 0.0
     n_pdv = df_gestor["PDV"].nunique()
+    comision_estimada = calcular_comision_estimada(proy_pct)
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("PDV a cargo", f"{n_pdv}")
     col2.metric("Cuota total", f"{cuota_total:,.0f}")
     col3.metric("Avance", f"{avance_total:,.0f}", f"{cumplimiento:.1%}")
     col4.metric("Proyección", f"{proy_total:,.0f}", f"{proy_pct:.1%}")
     col5.metric("Días restantes", f"{dias_restantes}")
+    col6.metric("💰 Comisión estimada", f"S/ {comision_estimada:,.0f}")
+    st.caption(
+        "La comisión estimada se calcula sobre el % de Proyección de cierre y una tabla de "
+        "niveles placeholder (REGLAS_COMISION en el código) — ajustar cuando definan las reglas reales."
+    )
 
     st.markdown("---")
-    st.markdown("#### Detalle por PDV")
+    st.markdown("#### Resumen por Producto (todos mis PDV)")
+
+    resumen_prod = resumen_producto_gestor(df_gestor, productos_sel, dias_en_mes, dia_corte)
+    st.dataframe(aplicar_estilo_resumen_gestor(resumen_prod), width="stretch")
 
     detalle_pdv = detalle_pdv_gestor(df_gestor, dias_en_mes, dia_corte)
     tabla_g = tabla_detalle_gestor(detalle_pdv, productos_sel)
-
     es_total = tabla_g.index.get_level_values("PDV") == "Total"
-    st.markdown("**Total de mi cartera**")
-    st.dataframe(aplicar_estilo_detalle_pdv(tabla_g[es_total], orden_prod_sel), width="stretch")
-    st.markdown(f"**Mis {n_pdv} PDV**")
-    st.dataframe(aplicar_estilo_detalle_pdv(tabla_g[~es_total], orden_prod_sel), width="stretch")
+
+    with st.expander(f"➕ Desagrupar: ver detalle por PDV ({n_pdv} punto(s) de venta)"):
+        st.dataframe(aplicar_estilo_detalle_pdv(tabla_g[~es_total], orden_prod_sel), width="stretch")
 
     st.markdown("---")
     st.markdown("#### Ritmo diario necesario")
@@ -863,10 +1032,12 @@ def vista_gestor(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, dias_restan
     if dias_restantes == 0:
         st.warning("El mes ya cerró; no quedan días para calcular el ritmo diario.")
 
+    ritmo_prod = ritmo_producto_gestor(df_gestor, productos_sel, dias_restantes)
+    st.dataframe(aplicar_estilo_ritmo_resumen(ritmo_prod), width="stretch")
+
     tabla_ritmo = ritmo_pdv_gestor(detalle_pdv, productos_sel, dias_restantes)
     es_total_r = tabla_ritmo.index.get_level_values("PDV") == "Total"
-    st.dataframe(aplicar_estilo_ritmo_gestor(tabla_ritmo[es_total_r], orden_prod_sel), width="stretch")
-    with st.expander(f"➕ Ver ritmo diario por PDV ({n_pdv} punto(s) de venta)"):
+    with st.expander(f"➕ Desagrupar: ver ritmo diario por PDV ({n_pdv} punto(s) de venta)"):
         st.dataframe(aplicar_estilo_ritmo_gestor(tabla_ritmo[~es_total_r], orden_prod_sel), width="stretch")
 
     st.markdown("---")
@@ -874,9 +1045,10 @@ def vista_gestor(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, dias_restan
         "DNI", "Nombre", "Departamento", "Provincia", "Distrito", "Producto", "PDV", "Nombre PDV",
         "Cuota", "Avance", "Cumplimiento %", "Proy Unidades",
     ]
+    tabla_csv = detalle_pdv[columnas_csv].rename(columns={"DNI": "DNI Gestor", "Nombre": "Nombre Gestor"})
     st.download_button(
         "⬇️ Descargar mi cartera (CSV)",
-        data=detalle_pdv[columnas_csv].sort_values(["Producto", "PDV"]).to_csv(index=False).encode("utf-8"),
+        data=tabla_csv.sort_values(["Producto", "PDV"]).to_csv(index=False).encode("utf-8"),
         file_name=f"mi_cartera_{dni_sel}.csv",
         mime="text/csv",
     )
@@ -913,13 +1085,21 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
     cumplimiento = (avance_total / cuota_total) if cuota_total > 0 else 0.0
     proy_total = avance_total * (dias_en_mes / max(dia_corte, 1))
     proy_pct = (proy_total / cuota_total) if cuota_total > 0 else 0.0
+    comision_total_estimada = df_filtrado.groupby("DNI").apply(
+        lambda g: calcular_comision_estimada(
+            (g["Avance"].sum() * (dias_en_mes / max(dia_corte, 1))) / g["Cuota"].sum()
+            if g["Cuota"].sum() > 0 else 0.0
+        ),
+        include_groups=False,
+    ).sum()
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Gestores", f"{df_filtrado['DNI'].nunique():,}")
     col2.metric("PDV", f"{df_filtrado['PDV'].nunique():,}")
     col3.metric("Cuota total", f"{cuota_total:,.0f}")
     col4.metric("Avance", f"{avance_total:,.0f}", f"{cumplimiento:.1%}")
     col5.metric("Proyección", f"{proy_total:,.0f}", f"{proy_pct:.1%}")
+    col6.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
 
     st.markdown("---")
     st.markdown("#### Resumen por Producto (por Departamento)")
