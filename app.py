@@ -168,9 +168,16 @@ def calcular_comision_estimada(cumplimiento_pct: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# RANGOS DE CUMPLIMIENTO (para el filtro "Rango de Cumplimiento" en Vista Gerencial)
+# RANGOS DE CUMPLIMIENTO (filtro "Rango de Cumplimiento" en Vista Gerencial)
 # ---------------------------------------------------------------------------
-RANGOS_CUMPLIMIENTO = [
+# El rango se calcula sobre el % de PROYECCIÓN (Proy Unidades / Cuota) de UN
+# producto específico — no sobre el total de todos los productos:
+#   - Si están seleccionados TODOS los productos, o solo "Prepago" → se usa
+#     Prepago, y aparece el rango especial "PDV no activo (0 ventas)".
+#   - Si se elige un único producto distinto de Prepago (Porta Prepago,
+#     Postpago, OSS) → se usa ese producto, y el rango más bajo es
+#     "0.00% – 80%" (sin el rango especial de "no activo").
+RANGOS_CON_NO_ACTIVO = [
     "PDV no activo (0 ventas)",
     "0.01% – 80%",
     "80.01% – 90%",
@@ -178,20 +185,42 @@ RANGOS_CUMPLIMIENTO = [
     "95.01% – 100%",
     "Más de 100%",
 ]
+RANGOS_SIN_NO_ACTIVO = [
+    "0.00% – 80%",
+    "80.01% – 90%",
+    "90.01% – 95%",
+    "95.01% – 100%",
+    "Más de 100%",
+]
 
 
-def clasificar_rango_cumplimiento(cumplimiento: float) -> str:
-    """Clasifica un % de cumplimiento (fracción, ej 0.85) en uno de los
-    RANGOS_CUMPLIMIENTO. cumplimiento <= 0 se considera 'PDV no activo'."""
-    if cumplimiento <= 0:
+def producto_base_para_rango(productos_sel: list) -> str:
+    """Determina sobre qué Producto se calcula el filtro de Rango de
+    Cumplimiento, según lo que esté seleccionado en el filtro Producto."""
+    if "Prepago" in productos_sel:
+        return "Prepago"
+    if len(productos_sel) == 1:
+        return productos_sel[0]
+    for p in PRODUCTOS:
+        if p in productos_sel:
+            return p
+    return "Prepago"
+
+
+def clasificar_rango_proyeccion(proy_pct: float, incluir_no_activo: bool) -> str:
+    """Clasifica un % de Proyección (fracción, ej 0.85) en un rango.
+    Si incluir_no_activo=True (producto base = Prepago), un valor <= 0 cae
+    en 'PDV no activo (0 ventas)'; si no, el rango más bajo es '0.00% – 80%'
+    e incluye también los valores en 0."""
+    if incluir_no_activo and proy_pct <= 0:
         return "PDV no activo (0 ventas)"
-    if cumplimiento <= 0.80:
-        return "0.01% – 80%"
-    if cumplimiento <= 0.90:
+    if proy_pct <= 0.80:
+        return "0.01% – 80%" if incluir_no_activo else "0.00% – 80%"
+    if proy_pct <= 0.90:
         return "80.01% – 90%"
-    if cumplimiento <= 0.95:
+    if proy_pct <= 0.95:
         return "90.01% – 95%"
-    if cumplimiento <= 1.00:
+    if proy_pct <= 1.00:
         return "95.01% – 100%"
     return "Más de 100%"
 
@@ -1238,19 +1267,36 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
     tabla = construir_tabla_producto(df_filtrado, agrupar_por, desagrupar, productos_sel, dias_en_mes, dia_corte)
     orden_prod_sel = [p for p in PRODUCTOS if p in productos_sel]
 
-    # --- Filtro por Rango de Cumplimiento (calculado sobre el total de la fila,
-    # sumando todos los productos seleccionados) ---
+    # --- Filtro por Rango de Cumplimiento: se basa en el % de PROYECCIÓN
+    # (unidades) de un solo producto — Prepago por defecto (o si es el único
+    # elegido), o el producto puntual si se eligió solo uno distinto. ---
+    producto_base = producto_base_para_rango(productos_sel)
+    incluir_no_activo = producto_base == "Prepago"
+    opciones_rango = RANGOS_CON_NO_ACTIVO if incluir_no_activo else RANGOS_SIN_NO_ACTIVO
+
+    # Si el usuario ya tenía seleccionado un rango que ya no es válido para
+    # el nuevo producto_base (ej. "PDV no activo" al cambiar a OSS), se
+    # limpia ANTES de crear el widget para no romper el multiselect.
+    valor_previo = st.session_state.get("rango_cumplimiento_gerencial", [])
+    interseccion = [v for v in valor_previo if v in opciones_rango]
+    if interseccion != valor_previo:
+        st.session_state["rango_cumplimiento_gerencial"] = interseccion
+
     rango_sel = st.multiselect(
         "Filtrar por Rango de Cumplimiento (opcional)",
-        options=RANGOS_CUMPLIMIENTO, default=[], key="rango_cumplimiento_gerencial",
+        options=opciones_rango, key="rango_cumplimiento_gerencial",
     )
-    if rango_sel:
-        cols_avance = [(p, "Avance") for p in orden_prod_sel if (p, "Avance") in tabla.columns]
-        cols_cuota = [(p, "Cuota") for p in orden_prod_sel if (p, "Cuota") in tabla.columns]
-        avance_fila = tabla[cols_avance].sum(axis=1)
-        cuota_fila = tabla[cols_cuota].sum(axis=1)
-        cumplimiento_fila = np.where(cuota_fila > 0, avance_fila / cuota_fila, 0.0)
-        rango_fila = pd.Series(cumplimiento_fila, index=tabla.index).map(clasificar_rango_cumplimiento)
+    st.caption(f"Este filtro se calcula sobre el % de Proyección (unidades) de **{producto_base}**.")
+
+    col_proy_base = (producto_base, "Proy Unidades")
+    col_cuota_base = (producto_base, "Cuota")
+    if rango_sel and col_proy_base in tabla.columns and col_cuota_base in tabla.columns:
+        proy_fila = tabla[col_proy_base]
+        cuota_fila = tabla[col_cuota_base]
+        proy_pct_fila = np.where(cuota_fila > 0, proy_fila / cuota_fila, 0.0)
+        rango_fila = pd.Series(proy_pct_fila, index=tabla.index).map(
+            lambda v: clasificar_rango_proyeccion(v, incluir_no_activo)
+        )
         tabla = tabla[rango_fila.isin(rango_sel)]
 
     altura = 480 if desagrupar else "content"
