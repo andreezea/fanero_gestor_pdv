@@ -393,6 +393,78 @@ def _aplicar_semaforo(styler, columnas: list):
     return styler
 
 
+def construir_tabla_producto(
+    df_filtrado: pd.DataFrame,
+    agrupar_por: str,
+    desagrupar: bool,
+    productos_sel: list,
+    dias_en_mes: int,
+    dia_corte: int,
+) -> pd.DataFrame:
+    """Construye la tabla 'Resumen por Producto' (Producto como columnas
+    agrupadas: Cuota, Avance, Cumplimiento %, Proy Unidades, Proy %), con
+    dos variantes intercambiables:
+
+    - agrupar_por="Departamento" → una fila por Departamento (o por
+      Departamento + PDV si desagrupar=True).
+    - agrupar_por="Gestor" → una fila por Gestor (o por Gestor + PDV si
+      desagrupar=True).
+
+    Es la vista única que reemplaza a la anterior separación entre
+    "Resumen por Producto" y "Ranking de gestores": eligiendo agrupar_por
+    y desagrupar se navega entre los 4 niveles de detalle posibles.
+    """
+    df_filtrado = df_filtrado.copy()
+    df_filtrado["_Gestor"] = df_filtrado["Nombre"] + " · DNI " + df_filtrado["DNI"]
+    df_filtrado["_PDV"] = np.where(
+        df_filtrado["Nombre PDV"] != "",
+        df_filtrado["PDV"] + " · " + df_filtrado["Nombre PDV"],
+        df_filtrado["PDV"],
+    )
+
+    nivel_col = "Departamento" if agrupar_por == "Departamento" else "_Gestor"
+    index_cols = [nivel_col] + (["_PDV"] if desagrupar else [])
+
+    largo = (
+        df_filtrado.groupby(index_cols + ["Producto"], as_index=False)
+        .agg(Cuota=("Cuota", "sum"), Avance=("Avance", "sum"))
+    )
+
+    orden_prod = [p for p in PRODUCTOS if p in productos_sel]
+
+    if not desagrupar:
+        if agrupar_por == "Departamento":
+            orden_nivel = [d for d in DEPARTAMENTOS if d in df_filtrado[nivel_col].unique()]
+        else:
+            orden_nivel = sorted(df_filtrado[nivel_col].unique())
+        combinaciones = pd.MultiIndex.from_product([orden_nivel, orden_prod], names=[nivel_col, "Producto"])
+        largo = largo.set_index([nivel_col, "Producto"]).reindex(combinaciones).reset_index()
+        largo[["Cuota", "Avance"]] = largo[["Cuota", "Avance"]].fillna(0)
+
+    largo["Cumplimiento %"] = np.where(largo["Cuota"] > 0, largo["Avance"] / largo["Cuota"], 0.0)
+    factor_proyeccion = dias_en_mes / max(dia_corte, 1)
+    largo["Proy Unidades"] = largo["Avance"] * factor_proyeccion
+    largo["Proy %"] = np.where(largo["Cuota"] > 0, largo["Proy Unidades"] / largo["Cuota"], 0.0)
+
+    metricas = ["Cuota", "Avance", "Cumplimiento %", "Proy Unidades", "Proy %"]
+    ancho = largo.pivot_table(index=index_cols, columns="Producto", values=metricas, aggfunc="first")
+    ancho = ancho.swaplevel(axis=1)
+    columnas_orden = pd.MultiIndex.from_product([orden_prod, metricas])
+
+    if not desagrupar:
+        ancho = ancho.reindex(index=orden_nivel, columns=columnas_orden)
+    else:
+        ancho = ancho.reindex(columns=columnas_orden).sort_index(level=0)
+
+    nombre_nivel = "Departamento" if agrupar_por == "Departamento" else "Gestor"
+    if desagrupar:
+        ancho.index = ancho.index.set_names([nombre_nivel, "PDV"])
+    else:
+        ancho.index = ancho.index.set_names([nombre_nivel])
+
+    return ancho
+
+
 def resumen_por_producto(df_filtrado: pd.DataFrame, departamentos_sel: list,
                           productos_sel: list, dias_en_mes: int, dia_corte: int) -> pd.DataFrame:
     """Resumen por Departamento con los productos como columnas agrupadas
@@ -1070,34 +1142,43 @@ def aplicar_estilo_detalle_plano(tabla: pd.DataFrame):
 
 
 def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
-    """Pestaña 'Vista Gerencial'. El selector de Departamento tiene una
-    opción "Fanero (Total)" que agrega TODOS los departamentos (el detalle
-    por Departamento y el ranking de TODOS los gestores siguen visibles
-    debajo, sumando al total). Si se elige un Departamento específico, se
-    habilita "Desagrupar" para ver el detalle de sus PDV."""
-    col_dep, col_prod = st.columns(2)
+    """Pestaña 'Vista Gerencial': una sola tabla tipo 'Resumen por Producto'
+    (igual formato que el reporte actual), con dos controles:
 
-    departamentos_disponibles = sorted(df["Departamento"].unique())
-    opciones_depto = ["Fanero (Total)"] + departamentos_disponibles
-    with col_dep:
-        depto_sel = st.selectbox("Departamento", opciones_depto, key="depto_gerencial")
-    with col_prod:
+    - "Agrupar por": Departamento o Gestor → cambia qué va en las filas.
+    - "Desagrupar (ver PDV)": agrega un segundo nivel de fila con el detalle
+      de cada Punto de Venta dentro de su Departamento o Gestor.
+
+    Así, con solo esos 2 controles se navegan los 4 niveles de detalle:
+    Departamento | Departamento+PDV | Gestor | Gestor+PDV.
+    """
+    col_a, col_b, col_c, col_d = st.columns([1.2, 1.2, 1.6, 1.6])
+
+    with col_a:
+        agrupar_por = st.radio("Agrupar por", ["Departamento", "Gestor"], key="agrupar_por_gerencial", horizontal=True)
+    with col_b:
+        desagrupar = st.checkbox("➕ Desagrupar (ver PDV)", key="desagrupar_gerencial")
+    with col_c:
+        departamentos_filtro = st.multiselect(
+            "Filtrar Departamento (opcional)", options=sorted(df["Departamento"].unique()),
+            default=[], key="depto_filtro_gerencial",
+        )
+    with col_d:
         productos_sel = st.multiselect(
             "Producto", options=PRODUCTOS, default=PRODUCTOS, key="producto_gerencial",
         )
+
     if not productos_sel:
         productos_sel = PRODUCTOS
+    departamentos_activos = departamentos_filtro if departamentos_filtro else sorted(df["Departamento"].unique())
 
-    es_total_fanero = depto_sel == "Fanero (Total)"
-    departamentos_sel = departamentos_disponibles if es_total_fanero else [depto_sel]
-
-    df_filtrado = df[df["Departamento"].isin(departamentos_sel) & df["Producto"].isin(productos_sel)]
+    df_filtrado = df[df["Departamento"].isin(departamentos_activos) & df["Producto"].isin(productos_sel)]
 
     if df_filtrado.empty:
         st.info("No hay datos para los filtros seleccionados.")
         return
 
-    # --- KPIs generales (Fanero total, o solo el departamento elegido) ---
+    # --- KPIs generales sobre lo filtrado ---
     cuota_total = df_filtrado["Cuota"].sum()
     avance_total = df_filtrado["Avance"].sum()
     cumplimiento = (avance_total / cuota_total) if cuota_total > 0 else 0.0
@@ -1120,50 +1201,24 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
     col6.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
 
     st.markdown("---")
-    if es_total_fanero:
-        st.markdown("#### Resumen por Producto (todos los Departamentos)")
-    else:
-        st.markdown(f"#### Resumen por Producto · {depto_sel}")
-    # El detalle por Departamento SIEMPRE se calcula sobre todos los
-    # departamentos disponibles cuando se elige "Fanero (Total)", para que
-    # cada fila (departamento) muestre su propio avance/proyección y sumen
-    # el total de arriba. Si se eligió un departamento puntual, la tabla
-    # queda con esa única fila.
-    tabla_resumen = resumen_por_producto(df_filtrado, departamentos_sel, productos_sel, dias_en_mes, dia_corte)
+    titulo = f"Resumen por Producto · agrupado por {agrupar_por}"
+    if desagrupar:
+        titulo += " (desagrupado por PDV)"
+    st.markdown(f"#### {titulo}")
+
+    tabla = construir_tabla_producto(df_filtrado, agrupar_por, desagrupar, productos_sel, dias_en_mes, dia_corte)
     orden_prod_sel = [p for p in PRODUCTOS if p in productos_sel]
-    st.dataframe(aplicar_estilo_resumen_producto(tabla_resumen, orden_prod_sel), width="stretch")
+    altura = 480 if desagrupar else "content"
+    st.dataframe(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), width="stretch", height=altura)
     st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Cumplimiento % y Proy %)")
 
-    if not es_total_fanero:
-        with st.expander(f"➕ Desagrupar: ver detalle por PDV en {depto_sel}"):
-            detalle_depto = detalle_pdv_gestor(df_filtrado, dias_en_mes, dia_corte)
-            detalle_depto = detalle_depto.rename(columns={"DNI": "DNI Gestor", "Nombre": "Nombre Gestor"})
-            columnas_orden = [
-                "DNI Gestor", "Nombre Gestor", "Departamento", "Provincia", "Distrito",
-                "Producto", "PDV", "Nombre PDV", "Cuota", "Avance", "Cumplimiento %", "Proy Unidades",
-            ]
-            detalle_depto = detalle_depto[columnas_orden].sort_values(["Nombre Gestor", "Producto", "PDV"])
-            st.dataframe(aplicar_estilo_detalle_plano(detalle_depto), width="stretch", height=420)
-            st.download_button(
-                "⬇️ Descargar detalle de PDV (CSV)",
-                data=detalle_depto.to_csv(index=False).encode("utf-8"),
-                file_name=f"detalle_pdv_{depto_sel.replace(' ', '_').lower()}.csv",
-                mime="text/csv",
-                key="descargar_detalle_depto",
-            )
-
-    st.markdown("---")
-    if es_total_fanero:
-        st.markdown("#### 🏆 Ranking de gestores (todos — Fanero)")
-    else:
-        st.markdown(f"#### 🏆 Ranking de gestores · {depto_sel}")
-    ranking = ranking_gestores(df_filtrado)
-    st.dataframe(aplicar_estilo_ranking(ranking), width="stretch", height=420)
-
+    tabla_csv = tabla.copy()
+    tabla_csv.columns = [f"{p} - {m}" for p, m in tabla_csv.columns]
+    nombre_archivo = f"resumen_{agrupar_por.lower()}{'_pdv' if desagrupar else ''}.csv"
     st.download_button(
-        "⬇️ Descargar ranking (CSV)",
-        data=ranking.to_csv(index=False).encode("utf-8"),
-        file_name="ranking_gestores.csv",
+        "⬇️ Descargar esta tabla (CSV)",
+        data=tabla_csv.reset_index().to_csv(index=False).encode("utf-8"),
+        file_name=nombre_archivo,
         mime="text/csv",
     )
 
