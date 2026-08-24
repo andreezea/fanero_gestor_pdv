@@ -1,0 +1,10 @@
+[theme]
+# Color de acento: se usa en multiselect, radio, checkbox, botones primarios,
+# barra activa de pestañas, sliders, etc. Cambiar aquí basta para recolorear
+# toda la app sin tocar app.py.
+primaryColor = "#1F5FBF"
+
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor = "#1F1F2E"
+font = "sans serif"
