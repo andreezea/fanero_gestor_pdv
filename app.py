@@ -685,9 +685,26 @@ def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
         fmt[(p, "Proy Unidades")] = "{:,.0f}"
         fmt[(p, "Proy %")] = "{:.1%}"
 
+    tiene_comparativo = ("M0 vs M-1", "M0") in tabla.columns
+    if tiene_comparativo:
+        fmt[("M0 vs M-1", "M0")] = "{:,.0f}"
+        fmt[("M0 vs M-1", "M-1")] = "{:,.0f}"
+        fmt[("M0 vs M-1", "%Var")] = "{:+.1%}"
+
     styler = tabla.style.format(fmt, na_rep="-")
     subset = [(p, "Proy %") for p in orden_prod]
     styler = _aplicar_semaforo(styler, subset)
+
+    if tiene_comparativo:
+        def _color_var(v):
+            if pd.isna(v):
+                return ""
+            return "color: #3E9B4F; font-weight: 600" if v >= 0 else "color: #D64545; font-weight: 600"
+        styler = styler.map(_color_var, subset=[("M0 vs M-1", "%Var")])
+
+    # Centra todo el contenido de la tabla (números y encabezados).
+    styler = styler.set_properties(**{"text-align": "center"})
+    styler = styler.set_table_styles([{"selector": "th", "props": [("text-align", "center")]}], overwrite=False)
 
     # Resalta la fila "Fanero (Total)" en negrita, si está presente.
     if "Fanero (Total)" in tabla.index:
@@ -1441,8 +1458,8 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     departamentos_activos = departamentos_filtro if departamentos_filtro else sorted(df["Departamento"].unique())
 
     # M0 / M-1 son SIEMPRE sobre Prepago, independientemente del filtro de
-    # Producto — por eso se calculan ANTES del filtro por Producto y del
-    # "return" temprano si ese filtro deja la tabla vacía.
+    # Producto. Se calculan aquí y se agregan como columnas adicionales al
+    # final de la tabla principal (después de OSS), no como tarjeta aparte.
     anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
     df_hist_mes_ant = obtener_historico_mes(mes_ant, anio_ant)
 
@@ -1452,22 +1469,21 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
             (df_hist_mes_ant["Departamento"].isin(departamentos_activos)) & (df_hist_mes_ant["Producto"] == "Prepago")
         ]["Avance"].sum()
         var_total_pct = ((m0_total - m1_total) / m1_total) if m1_total > 0 else (1.0 if m0_total > 0 else 0.0)
-        m0_m1_delta = f"M-1: {m1_total:,.0f} ({var_total_pct:+.1%})"
     else:
-        m0_m1_delta = "M-1: — (sin histórico aún)"
+        m1_total = np.nan
+        var_total_pct = np.nan
 
     df_filtrado = df[df["Departamento"].isin(departamentos_activos) & df["Producto"].isin(productos_sel)]
 
     if df_filtrado.empty:
-        cols_vacio = st.columns(7)
+        cols_vacio = st.columns(6)
         cols_vacio[0].metric("Gestores", "0")
         cols_vacio[1].metric("PDV", "0")
         cols_vacio[2].metric("Cuota total", "0")
         cols_vacio[3].metric("Avance", "0")
         cols_vacio[4].metric("Proyección", "0")
-        cols_vacio[5].metric("M0 (Prepago)", f"{m0_total:,.0f}", m0_m1_delta)
-        cols_vacio[6].metric("💰 Comisión total estimada", "S/ 0")
-        st.info("No hay datos para el filtro de Producto seleccionado (M0/M-1 arriba son de Prepago y no dependen de este filtro).")
+        cols_vacio[5].metric("💰 Comisión total estimada", "S/ 0")
+        st.info("No hay datos para el filtro de Producto seleccionado.")
         return
 
     # --- KPIs generales sobre lo filtrado ---
@@ -1484,16 +1500,13 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         include_groups=False,
     ).sum()
 
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Gestores", f"{df_filtrado['DNI'].nunique():,}")
     col2.metric("PDV", f"{df_filtrado['PDV'].nunique():,}")
     col3.metric("Cuota total", f"{cuota_total:,.0f}")
     col4.metric("Avance", f"{avance_total:,.0f}", f"{cumplimiento:.1%}")
     col5.metric("Proyección", f"{proy_total:,.0f}", f"{proy_pct:.1%}")
-    col6.metric("M0 (Prepago)", f"{m0_total:,.0f}", m0_m1_delta)
-    col7.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
-    if df_hist_mes_ant is None:
-        st.caption("M-1 aparecerá disponible en cuanto se publique el mes siguiente (la app archiva cada mes automáticamente).")
+    col6.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
 
     st.markdown("---")
     titulo = f"Resumen por Producto · agrupado por {agrupar_por}"
@@ -1503,6 +1516,21 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
 
     tabla = construir_tabla_producto(df_filtrado, agrupar_por, desagrupar, productos_sel, dias_en_mes, dia_corte)
     orden_prod_sel = [p for p in PRODUCTOS if p in productos_sel]
+
+    # --- Columnas M0 / M-1 / %Var, agregadas AL FINAL de la tabla (después
+    # de OSS), como un grupo más "M0 vs M-1" — solo cuando no se desagrupa
+    # por PDV (a nivel PDV individual no se calcula, por ahora). ---
+    if not desagrupar:
+        df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
+        comparativo, hay_historico = tabla_comparativo_mensual(df_scope_depto, mes, anio, agrupar_por)
+        fila_total_comp = pd.DataFrame(
+            [{"M0": m0_total, "M-1": m1_total, "%Var": var_total_pct}], index=["Fanero (Total)"]
+        )
+        comparativo = pd.concat([fila_total_comp, comparativo])
+        comparativo.columns = pd.MultiIndex.from_tuples([("M0 vs M-1", c) for c in comparativo.columns])
+        tabla = tabla.join(comparativo, how="left")
+    else:
+        hay_historico = None
 
     # --- Filtro por Rango de Cumplimiento: se basa en el % de PROYECCIÓN
     # (unidades) de un solo producto — Prepago por defecto (o si es el único
@@ -1546,7 +1574,15 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         st.info("No hay filas para el Rango de Cumplimiento seleccionado.")
     else:
         st.dataframe(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), width="stretch", height=altura)
-    st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Proy %)")
+    leyenda = "🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Proy %)"
+    if not desagrupar:
+        leyenda += " · M0 = venta Prepago este mes · M-1 = venta Prepago mes anterior"
+    st.caption(leyenda)
+    if not desagrupar and not hay_historico:
+        st.info(
+            "M-1 y %Var todavía no tienen datos: no hay histórico del mes anterior guardado "
+            "(normal en el primer mes usando la app, o puedes cargarlo manualmente en el panel admin)."
+        )
 
     tabla_csv = tabla.copy()
     tabla_csv.columns = [f"{p} - {m}" for p, m in tabla_csv.columns]
@@ -1556,29 +1592,6 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         data=tabla_csv.reset_index().to_csv(index=False).encode("utf-8"),
         file_name=nombre_archivo,
         mime="text/csv",
-    )
-
-    st.markdown("---")
-    st.markdown("#### 📈 Comparativo mensual (Prepago): M0 vs M-1")
-    # Igual que arriba: el comparativo M0/M-1 es siempre sobre Prepago, así
-    # que se calcula sobre el Departamento filtrado, sin aplicar el filtro
-    # de Producto (que podría excluir Prepago de la tabla por error).
-    df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
-    comparativo, hay_historico = tabla_comparativo_mensual(df_scope_depto, mes, anio, agrupar_por)
-    if not hay_historico:
-        st.info(
-            "Todavía no hay histórico del mes anterior guardado (esto es normal en el primer mes "
-            "usando la app). En cuanto se publique el mes siguiente, M-1 y %Var se completan solos — "
-            "la app archiva automáticamente cada mes al cerrarlo."
-        )
-    st.dataframe(aplicar_estilo_comparativo(comparativo), width="stretch", height=420)
-    st.caption("M0 = venta acumulada de Prepago este mes · M-1 = venta acumulada de Prepago el mes anterior (histórico)")
-    st.download_button(
-        "⬇️ Descargar comparativo M0 vs M-1 (CSV)",
-        data=comparativo.reset_index().to_csv(index=False).encode("utf-8"),
-        file_name="comparativo_m0_m1.csv",
-        mime="text/csv",
-        key="descargar_comparativo",
     )
 
 
