@@ -576,7 +576,7 @@ def construir_tabla_producto(
     - agrupar_por="Gestor" → una fila por Gestor (o por Gestor + PDV si
       desagrupar=True).
 
-    Cuando NO se desagrupa, se agrega una fila "Fanero (Total)" al inicio
+    Cuando NO se desagrupa, se agrega una fila "Fanero" al final
     con la suma de TODO lo que esté en df_filtrado (todos los departamentos
     o todos los gestores, según corresponda) — sus % se recalculan sobre
     los totales, no se promedian filas.
@@ -620,9 +620,9 @@ def construir_tabla_producto(
     if not desagrupar:
         ancho = ancho.reindex(index=orden_nivel, columns=columnas_orden)
 
-        # --- Fila "Fanero (Total)": suma real de Cuota/Avance/Proy Unidades
-        # de TODAS las filas, con Proy % recalculado sobre esos totales
-        # (no es el promedio de los % de cada fila). ---
+        # --- Fila "Fanero": suma real de Cuota/Avance/Proy Unidades de
+        # TODAS las filas, con Proy % recalculado sobre esos totales (no es
+        # el promedio de los % de cada fila). Va al FINAL de la tabla. ---
         fila_total = {}
         for p in orden_prod:
             cuota_p = ancho[(p, "Cuota")].sum() if (p, "Cuota") in ancho.columns else 0.0
@@ -632,8 +632,8 @@ def construir_tabla_producto(
             fila_total[(p, "Avance")] = avance_p
             fila_total[(p, "Proy Unidades")] = proy_p
             fila_total[(p, "Proy %")] = (proy_p / cuota_p) if cuota_p > 0 else 0.0
-        df_total = pd.DataFrame([fila_total], index=["Fanero (Total)"], columns=columnas_orden)
-        ancho = pd.concat([df_total, ancho])
+        df_total = pd.DataFrame([fila_total], index=["Fanero"], columns=columnas_orden)
+        ancho = pd.concat([ancho, df_total])
     else:
         ancho = ancho.reindex(columns=columnas_orden).sort_index(level=0)
 
@@ -702,11 +702,15 @@ def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
             return "color: #3E9B4F; font-weight: 600" if v >= 0 else "color: #D64545; font-weight: 600"
         styler = styler.map(_color_var, subset=[("M0 vs M-1", "%Var")])
 
-    # Resalta la fila "Fanero (Total)" en negrita, si está presente.
-    if "Fanero (Total)" in tabla.index:
-        def _negrita_total(fila):
-            return ["font-weight: 700" if fila.name == "Fanero (Total)" else "" for _ in fila]
-        styler = styler.apply(_negrita_total, axis=1)
+    # Fila "Fanero" (total general): sombreado ejecutivo distinto — fondo
+    # azul marino oscuro con texto blanco, para que se note como el cierre
+    # de la tabla y no se confunda con el semáforo de las demás filas.
+    if "Fanero" in tabla.index:
+        def _estilo_total(fila):
+            if fila.name == "Fanero":
+                return ["background-color: #1F2937; color: #FFFFFF; font-weight: 700;" for _ in fila]
+            return ["" for _ in fila]
+        styler = styler.apply(_estilo_total, axis=1)
 
     # Bordes + centrado. Esto solo se ve completo cuando la tabla se
     # renderiza como HTML (ver `renderizar_tabla_centrada`) — el widget
@@ -1549,7 +1553,7 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
         comparativo, hay_historico = tabla_comparativo_mensual(df_scope_depto, mes, anio, agrupar_por)
         fila_total_comp = pd.DataFrame(
-            [{"M0": m0_total, "M-1": m1_total, "%Var": var_total_pct}], index=["Fanero (Total)"]
+            [{"M0": m0_total, "M-1": m1_total, "%Var": var_total_pct}], index=["Fanero"]
         )
         comparativo = pd.concat([fila_total_comp, comparativo])
         comparativo.columns = pd.MultiIndex.from_tuples([("M0 vs M-1", c) for c in comparativo.columns])
@@ -1587,11 +1591,11 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         rango_fila = pd.Series(proy_pct_fila, index=tabla.index).map(
             lambda v: clasificar_rango_proyeccion(v, incluir_no_activo)
         )
-        # La fila "Fanero (Total)" nunca se oculta por este filtro — sirve
+        # La fila "Fanero" nunca se oculta por este filtro — sirve
         # de contexto siempre visible, sin importar qué rango se elija.
         mascara = rango_fila.isin(rango_sel)
-        if "Fanero (Total)" in tabla.index:
-            mascara.loc["Fanero (Total)"] = True
+        if "Fanero" in tabla.index:
+            mascara.loc["Fanero"] = True
         tabla = tabla[mascara]
 
     if tabla.empty:
