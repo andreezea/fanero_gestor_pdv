@@ -383,6 +383,83 @@ def obtener_historico_mes(mes: int, anio: int) -> pd.DataFrame | None:
     return None
 
 
+MESES_ES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "setiembre": 9, "septiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+
+
+def _nombre_producto_normalizado(texto: str) -> str | None:
+    """Empareja un nombre de columna (ej. 'Porta prepago', 'oss') con el
+    Producto oficial correspondiente de PRODUCTOS, sin importar mayúsculas."""
+    limpio = str(texto).strip().lower()
+    for p in PRODUCTOS:
+        if p.lower() == limpio:
+            return p
+    return None
+
+
+def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referencia: pd.DataFrame) -> dict[int, pd.DataFrame]:
+    """Convierte una tabla ANCHA de ventas de meses anteriores (una columna
+    por producto) al formato interno que usa la app, agrupando por mes si el
+    archivo trae más de uno. Formato esperado:
+
+        DNI          | Mes    | Prepago | Porta Prepago | Postpago | OSS
+        11111111     | julio  | 29      | 20            | 10       | 26
+
+    Devuelve {mes_numero: DataFrame_listo_para_archivar}. Nombre/Departamento/
+    Provincia/Distrito se completan buscando el DNI en `df_referencia` (los
+    datos ya publicados) — si un DNI no aparece ahí, queda con esos campos
+    vacíos, pero su venta igual se cuenta en los totales generales.
+    """
+    if "DNI" not in df_ancho.columns or "Mes" not in df_ancho.columns:
+        raise ValueError("El archivo debe tener al menos las columnas 'DNI' y 'Mes'.")
+
+    df_ancho = df_ancho.copy()
+    df_ancho["DNI"] = df_ancho["DNI"].astype(str).str.strip()
+    df_ancho["_MesTexto"] = df_ancho["Mes"].astype(str).str.strip().str.lower()
+    df_ancho["_MesNumero"] = df_ancho["_MesTexto"].map(MESES_ES)
+
+    mapa_col_producto = {}
+    for col in df_ancho.columns:
+        if col in ("DNI", "Mes", "_MesTexto", "_MesNumero"):
+            continue
+        producto = _nombre_producto_normalizado(col)
+        if producto:
+            mapa_col_producto[col] = producto
+
+    if not mapa_col_producto:
+        raise ValueError(
+            "No se reconoció ninguna columna de producto. Deben llamarse "
+            "exactamente: " + ", ".join(PRODUCTOS)
+        )
+
+    df_ancho = df_ancho.dropna(subset=["_MesNumero"])
+    if df_ancho.empty:
+        raise ValueError("No se reconoció ningún mes válido en la columna 'Mes'.")
+
+    ref_cols = [c for c in ["DNI", "Nombre", "Departamento", "Provincia", "Distrito"] if c in df_referencia.columns]
+    ref = df_referencia[ref_cols].drop_duplicates(subset=["DNI"]) if "DNI" in ref_cols else pd.DataFrame(columns=["DNI"])
+
+    resultados: dict[int, pd.DataFrame] = {}
+    for mes_num, grupo_mes in df_ancho.groupby("_MesNumero"):
+        filas = []
+        for _, fila in grupo_mes.iterrows():
+            for col_original, producto in mapa_col_producto.items():
+                valor = fila[col_original]
+                if pd.isna(valor):
+                    continue
+                filas.append({"DNI": fila["DNI"], "Producto": producto, "Avance": float(valor)})
+        df_largo = pd.DataFrame(filas)
+        if df_largo.empty:
+            continue
+        df_largo = df_largo.merge(ref, on="DNI", how="left")
+        resultados[int(mes_num)] = _normalizar_identidad(df_largo)
+
+    return resultados
+
+
 def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> None:
     """Publica una carga SUMANDO el Avance nuevo al acumulado ya publicado
     del mismo Mes/Año (en vez de reemplazarlo). Así el administrador puede
@@ -491,17 +568,18 @@ def construir_tabla_producto(
     dia_corte: int,
 ) -> pd.DataFrame:
     """Construye la tabla 'Resumen por Producto' (Producto como columnas
-    agrupadas: Cuota, Avance, Cumplimiento %, Proy Unidades, Proy %), con
-    dos variantes intercambiables:
+    agrupadas: Cuota, Avance, Proy Unidades, Proy %), con dos variantes
+    intercambiables:
 
     - agrupar_por="Departamento" → una fila por Departamento (o por
       Departamento + PDV si desagrupar=True).
     - agrupar_por="Gestor" → una fila por Gestor (o por Gestor + PDV si
       desagrupar=True).
 
-    Es la vista única que reemplaza a la anterior separación entre
-    "Resumen por Producto" y "Ranking de gestores": eligiendo agrupar_por
-    y desagrupar se navega entre los 4 niveles de detalle posibles.
+    Cuando NO se desagrupa, se agrega una fila "Fanero (Total)" al inicio
+    con la suma de TODO lo que esté en df_filtrado (todos los departamentos
+    o todos los gestores, según corresponda) — sus % se recalculan sobre
+    los totales, no se promedian filas.
     """
     df_filtrado = df_filtrado.copy()
     df_filtrado["_Gestor"] = df_filtrado["Nombre"] + " · DNI " + df_filtrado["DNI"]
@@ -520,6 +598,7 @@ def construir_tabla_producto(
     )
 
     orden_prod = [p for p in PRODUCTOS if p in productos_sel]
+    factor_proyeccion = dias_en_mes / max(dia_corte, 1)
 
     if not desagrupar:
         if agrupar_por == "Departamento":
@@ -530,18 +609,31 @@ def construir_tabla_producto(
         largo = largo.set_index([nivel_col, "Producto"]).reindex(combinaciones).reset_index()
         largo[["Cuota", "Avance"]] = largo[["Cuota", "Avance"]].fillna(0)
 
-    largo["Cumplimiento %"] = np.where(largo["Cuota"] > 0, largo["Avance"] / largo["Cuota"], 0.0)
-    factor_proyeccion = dias_en_mes / max(dia_corte, 1)
     largo["Proy Unidades"] = largo["Avance"] * factor_proyeccion
     largo["Proy %"] = np.where(largo["Cuota"] > 0, largo["Proy Unidades"] / largo["Cuota"], 0.0)
 
-    metricas = ["Cuota", "Avance", "Cumplimiento %", "Proy Unidades", "Proy %"]
+    metricas = ["Cuota", "Avance", "Proy Unidades", "Proy %"]
     ancho = largo.pivot_table(index=index_cols, columns="Producto", values=metricas, aggfunc="first")
     ancho = ancho.swaplevel(axis=1)
     columnas_orden = pd.MultiIndex.from_product([orden_prod, metricas])
 
     if not desagrupar:
         ancho = ancho.reindex(index=orden_nivel, columns=columnas_orden)
+
+        # --- Fila "Fanero (Total)": suma real de Cuota/Avance/Proy Unidades
+        # de TODAS las filas, con Proy % recalculado sobre esos totales
+        # (no es el promedio de los % de cada fila). ---
+        fila_total = {}
+        for p in orden_prod:
+            cuota_p = ancho[(p, "Cuota")].sum() if (p, "Cuota") in ancho.columns else 0.0
+            avance_p = ancho[(p, "Avance")].sum() if (p, "Avance") in ancho.columns else 0.0
+            proy_p = ancho[(p, "Proy Unidades")].sum() if (p, "Proy Unidades") in ancho.columns else 0.0
+            fila_total[(p, "Cuota")] = cuota_p
+            fila_total[(p, "Avance")] = avance_p
+            fila_total[(p, "Proy Unidades")] = proy_p
+            fila_total[(p, "Proy %")] = (proy_p / cuota_p) if cuota_p > 0 else 0.0
+        df_total = pd.DataFrame([fila_total], index=["Fanero (Total)"], columns=columnas_orden)
+        ancho = pd.concat([df_total, ancho])
     else:
         ancho = ancho.reindex(columns=columnas_orden).sort_index(level=0)
 
@@ -590,13 +682,20 @@ def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
     for p in orden_prod:
         fmt[(p, "Cuota")] = "{:,.0f}"
         fmt[(p, "Avance")] = "{:,.0f}"
-        fmt[(p, "Cumplimiento %")] = "{:.1%}"
         fmt[(p, "Proy Unidades")] = "{:,.0f}"
         fmt[(p, "Proy %")] = "{:.1%}"
 
     styler = tabla.style.format(fmt, na_rep="-")
-    subset = [(p, "Cumplimiento %") for p in orden_prod] + [(p, "Proy %") for p in orden_prod]
-    return _aplicar_semaforo(styler, subset)
+    subset = [(p, "Proy %") for p in orden_prod]
+    styler = _aplicar_semaforo(styler, subset)
+
+    # Resalta la fila "Fanero (Total)" en negrita, si está presente.
+    if "Fanero (Total)" in tabla.index:
+        def _negrita_total(fila):
+            return ["font-weight: 700" if fila.name == "Fanero (Total)" else "" for _ in fila]
+        styler = styler.apply(_negrita_total, axis=1)
+
+    return styler
 
 
 def ranking_gestores(df_filtrado: pd.DataFrame) -> pd.DataFrame:
@@ -890,6 +989,50 @@ def panel_admin() -> None:
     if os.path.exists(DATA_FILE):
         ultima_actualizacion = datetime.fromtimestamp(os.path.getmtime(DATA_FILE))
         st.caption(f"Última publicación: {ultima_actualizacion:%d/%m/%Y %H:%M}")
+
+    st.markdown("---")
+    st.markdown("#### 📂 Cargar ventas de un mes anterior (para M-1)")
+    st.caption(
+        "Sirve para tener M-1 disponible de inmediato, sin esperar a que la app archive "
+        "un mes completo por sí sola. Sube una tabla con una fila por Gestor (DNI), el "
+        "Mes en texto, y una columna por producto con el total vendido ese mes:"
+    )
+    st.code("DNI | Mes | Prepago | Porta Prepago | Postpago | OSS", language=None)
+    st.caption(
+        "Los nombres de columna deben coincidir exactamente con los productos "
+        f"({', '.join(PRODUCTOS)}). Si el archivo trae varios meses en la columna "
+        "'Mes', se guardan todos por separado."
+    )
+
+    anio_historico = st.number_input(
+        "Año de este archivo histórico", min_value=2020, max_value=2100,
+        value=datetime.now().year, step=1, key="anio_historico_carga",
+    )
+    archivo_historico = st.file_uploader(
+        "Excel de ventas de mes(es) anterior(es) (formato ancho)", type=["xlsx"], key="uploader_historico_ancho",
+    )
+
+    if archivo_historico is not None and st.button("Guardar como histórico"):
+        try:
+            df_ancho = pd.read_excel(archivo_historico)
+        except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
+            st.error(f"No se pudo leer el archivo: {exc}")
+            df_ancho = None
+
+        if df_ancho is not None:
+            df_referencia, _, _, _ = obtener_datos_publicados()
+            try:
+                resultados = procesar_carga_historico_ancho(df_ancho, int(anio_historico), df_referencia)
+            except ValueError as exc:
+                st.error(str(exc))
+                resultados = {}
+
+            if resultados:
+                for mes_num, df_mes in resultados.items():
+                    _archivar_mes(df_mes, mes_num, int(anio_historico))
+                meses_nombres = {v: k for k, v in MESES_ES.items() if k not in ("setiembre",)}
+                meses_guardados = ", ".join(meses_nombres.get(m, str(m)) for m in sorted(resultados.keys()))
+                st.success(f"Histórico guardado para: {meses_guardados} de {int(anio_historico)}.")
 
 
 # =============================================================================
@@ -1395,14 +1538,19 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         rango_fila = pd.Series(proy_pct_fila, index=tabla.index).map(
             lambda v: clasificar_rango_proyeccion(v, incluir_no_activo)
         )
-        tabla = tabla[rango_fila.isin(rango_sel)]
+        # La fila "Fanero (Total)" nunca se oculta por este filtro — sirve
+        # de contexto siempre visible, sin importar qué rango se elija.
+        mascara = rango_fila.isin(rango_sel)
+        if "Fanero (Total)" in tabla.index:
+            mascara.loc["Fanero (Total)"] = True
+        tabla = tabla[mascara]
 
     altura = 480 if desagrupar else "content"
     if tabla.empty:
         st.info("No hay filas para el Rango de Cumplimiento seleccionado.")
     else:
         st.dataframe(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), width="stretch", height=altura)
-    st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Cumplimiento % y Proy %)")
+    st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Proy %)")
 
     tabla_csv = tabla.copy()
     tabla_csv.columns = [f"{p} - {m}" for p, m in tabla_csv.columns]
