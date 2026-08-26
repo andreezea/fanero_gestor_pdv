@@ -69,6 +69,7 @@ DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "ultima_carga.xlsx")
 DATA_META = os.path.join(DATA_DIR, "meta.json")
 LOG_EDICION = os.path.join(DATA_DIR, "ultima_edicion.json")
+HISTORICO_DIR = os.path.join(DATA_DIR, "historico")
 
 # Geografía de referencia: Departamento → Provincia → Distritos. Se conserva
 # tal cual de la versión anterior (misma fuente para plantilla y ejemplo).
@@ -355,6 +356,23 @@ def publicar_datos(df: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> Non
     _leer_excel_publicado.clear()  # invalida el cache de lectura
 
 
+def _archivar_mes(df: pd.DataFrame, mes: int, anio: int) -> None:
+    """Guarda una copia final del mes saliente en data/historico/AAAA_MM.xlsx,
+    para poder comparar M0 (mes actual) vs M-1 (mes anterior) más adelante."""
+    os.makedirs(HISTORICO_DIR, exist_ok=True)
+    ruta = os.path.join(HISTORICO_DIR, f"{anio}_{mes:02d}.xlsx")
+    _normalizar_identidad(df).to_excel(ruta, index=False)
+
+
+def obtener_historico_mes(mes: int, anio: int) -> pd.DataFrame | None:
+    """Devuelve los datos archivados de un Mes/Año específico, o None si no
+    existe (por ejemplo, el primer mes usando la app, antes de tener historial)."""
+    ruta = os.path.join(HISTORICO_DIR, f"{anio}_{mes:02d}.xlsx")
+    if os.path.exists(ruta):
+        return _normalizar_identidad(pd.read_excel(ruta))
+    return None
+
+
 def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> None:
     """Publica una carga SUMANDO el Avance nuevo al acumulado ya publicado
     del mismo Mes/Año (en vez de reemplazarlo). Así el administrador puede
@@ -368,7 +386,8 @@ def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int,
     - DNI + PDV + Producto nuevos (PDV que se agrega a mitad de mes) → se
       agregan con su Avance tal como vienen en el archivo.
     - Si el Mes/Año de la carga es distinto al que había publicado (mes
-      nuevo) → se empieza de cero, igual que `publicar_datos`.
+      nuevo) → el mes saliente se ARCHIVA automáticamente (para M-1) y se
+      empieza de cero, igual que `publicar_datos`.
     """
     df_nuevo = _normalizar_identidad(df_nuevo)
 
@@ -377,6 +396,8 @@ def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int,
     if hay_publicacion_previa:
         df_actual, _, mes_actual, anio_actual = obtener_datos_publicados()
         mismo_periodo = (int(mes_actual) == int(mes)) and (int(anio_actual) == int(anio))
+        if not mismo_periodo:
+            _archivar_mes(df_actual, mes_actual, anio_actual)
 
     if not mismo_periodo:
         # Primera carga del mes (o primera carga de todas): no hay nada que sumar.
@@ -1199,7 +1220,62 @@ def aplicar_estilo_detalle_plano(tabla: pd.DataFrame):
     return _aplicar_semaforo(styler, columnas_semaforo)
 
 
-def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
+def tabla_comparativo_mensual(df_filtrado: pd.DataFrame, mes: int, anio: int, agrupar_por: str) -> tuple[pd.DataFrame, bool]:
+    """Construye la tabla M0 (venta Prepago del mes actual) vs M-1 (venta
+    Prepago del mismo Departamento/Gestor el mes anterior, según el
+    histórico archivado) y %Var. Devuelve (tabla, hay_historico) — si no hay
+    histórico del mes anterior (por ejemplo, el primer mes usando la app),
+    hay_historico=False y M-1/%Var quedan vacíos en vez de mostrar '0%'
+    engañoso."""
+    anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
+    df_hist = obtener_historico_mes(mes_ant, anio_ant)
+
+    df_prepago = df_filtrado[df_filtrado["Producto"] == "Prepago"].copy()
+    if agrupar_por == "Departamento":
+        nivel_col = "Departamento"
+        df_prepago["_Nivel"] = df_prepago["Departamento"]
+    else:
+        df_prepago["_Nivel"] = df_prepago["Nombre"] + " · DNI " + df_prepago["DNI"]
+
+    m0 = df_prepago.groupby("_Nivel")["Avance"].sum().rename("M0")
+
+    if df_hist is None:
+        comparativo = m0.to_frame()
+        comparativo["M-1"] = np.nan
+        comparativo["%Var"] = np.nan
+        comparativo.index.name = "Departamento" if agrupar_por == "Departamento" else "Gestor"
+        return comparativo.sort_values("M0", ascending=False), False
+
+    df_prepago_hist = df_hist[df_hist["Producto"] == "Prepago"].copy()
+    if agrupar_por == "Departamento":
+        df_prepago_hist["_Nivel"] = df_prepago_hist["Departamento"]
+    else:
+        df_prepago_hist["_Nivel"] = df_prepago_hist["Nombre"] + " · DNI " + df_prepago_hist["DNI"]
+    m1 = df_prepago_hist.groupby("_Nivel")["Avance"].sum().rename("M-1")
+
+    comparativo = pd.concat([m0, m1], axis=1)
+    comparativo["M0"] = comparativo["M0"].fillna(0)
+    comparativo["M-1"] = comparativo["M-1"].fillna(0)
+    comparativo["%Var"] = np.where(
+        comparativo["M-1"] > 0,
+        (comparativo["M0"] - comparativo["M-1"]) / comparativo["M-1"],
+        np.where(comparativo["M0"] > 0, 1.0, 0.0),
+    )
+    comparativo.index.name = "Departamento" if agrupar_por == "Departamento" else "Gestor"
+    return comparativo.sort_values("M0", ascending=False), True
+
+
+def aplicar_estilo_comparativo(tabla: pd.DataFrame):
+    def _color_var(v):
+        if pd.isna(v):
+            return ""
+        return "color: #3E9B4F; font-weight: 600" if v >= 0 else "color: #D64545; font-weight: 600"
+
+    styler = tabla.style.format({"M0": "{:,.0f}", "M-1": "{:,.0f}", "%Var": "{:+.1%}"}, na_rep="—")
+    return styler.map(_color_var, subset=["%Var"])
+
+
+def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int, anio: int) -> None:
     """Pestaña 'Vista Gerencial': una sola tabla tipo 'Resumen por Producto'
     (igual formato que el reporte actual), con dos controles:
 
@@ -1316,14 +1392,81 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
         mime="text/csv",
     )
 
+    st.markdown("---")
+    st.markdown("#### 📈 Comparativo mensual (Prepago): M0 vs M-1")
+    comparativo, hay_historico = tabla_comparativo_mensual(df_filtrado, mes, anio, agrupar_por)
+    if not hay_historico:
+        st.info(
+            "Todavía no hay histórico del mes anterior guardado (esto es normal en el primer mes "
+            "usando la app). En cuanto se publique el mes siguiente, M-1 y %Var se completan solos — "
+            "la app archiva automáticamente cada mes al cerrarlo."
+        )
+    st.dataframe(aplicar_estilo_comparativo(comparativo), width="stretch", height=420)
+    st.caption("M0 = venta acumulada de Prepago este mes · M-1 = venta acumulada de Prepago el mes anterior (histórico)")
+    st.download_button(
+        "⬇️ Descargar comparativo M0 vs M-1 (CSV)",
+        data=comparativo.reset_index().to_csv(index=False).encode("utf-8"),
+        file_name="comparativo_m0_m1.csv",
+        mime="text/csv",
+        key="descargar_comparativo",
+    )
+
+
+def _credenciales_visualizacion() -> tuple[str, str]:
+    """Usuario/clave compartido para poder VER el dashboard (distinto del
+    admin, que solo puede publicar datos). Configurar en Streamlit Cloud →
+    Settings → Secrets:
+
+    [visualizacion]
+    usuario = "..."
+    password = "..."
+    """
+    try:
+        return st.secrets["visualizacion"]["usuario"], st.secrets["visualizacion"]["password"]
+    except Exception:  # noqa: BLE001 - no hay secrets configurados aún
+        return "fanero", "fanero2026"
+
+
+def verificar_acceso_general() -> bool:
+    """Muestra un login simple antes de dejar ver el dashboard. Si ya se
+    inició sesión como administrador (panel_admin), no se pide de nuevo."""
+    if st.session_state.get("es_admin", False):
+        return True
+    if st.session_state.get("acceso_autorizado", False):
+        return True
+
+    st.title("📊 Mi Cartera - Gestores Fanero")
+    st.caption("Ingresa tus credenciales para ver el dashboard.")
+
+    with st.form("form_login_general"):
+        usuario = st.text_input("Usuario")
+        clave = st.text_input("Contraseña", type="password")
+        enviar = st.form_submit_button("Ingresar")
+
+    if enviar:
+        usuario_ok, clave_ok = _credenciales_visualizacion()
+        if usuario == usuario_ok and clave == clave_ok:
+            st.session_state["acceso_autorizado"] = True
+            st.rerun()
+        else:
+            st.error("Usuario o contraseña incorrectos.")
+
+    return False
+
 
 def main():
-    st.title("📊 Mi Cartera - Gestores Fanero")
-
-    # Los paneles ocultos solo se renderizan con sus parámetros en la URL.
+    # El panel admin (?admin=1) se renderiza SIEMPRE, incluso sin haber
+    # iniciado sesión de visualización, para que el administrador pueda
+    # loguearse de forma independiente.
     if st.query_params.get("admin") == "1":
         with st.sidebar:
             panel_admin()
+
+    if not verificar_acceso_general():
+        return
+
+    st.title("📊 Mi Cartera - Gestores Fanero")
+
     mostrar_editor = st.query_params.get("editar") == "1"
 
     df_raw, dia_corte, mes, anio = obtener_datos_publicados()
@@ -1353,12 +1496,19 @@ def main():
         vista_gestor(df, dias_en_mes, dia_corte, dias_restantes)
 
     with tabs[1]:
-        vista_gerencial(df, dias_en_mes, dia_corte)
+        vista_gerencial(df, dias_en_mes, dia_corte, mes, anio)
 
     if mostrar_editor:
         with tabs[2]:
             st.subheader("Editar Avances")
             panel_editar_avances(df_raw)
+
+    with st.sidebar:
+        if st.session_state.get("acceso_autorizado", False) and not st.session_state.get("es_admin", False):
+            st.markdown("---")
+            if st.button("Cerrar sesión"):
+                st.session_state["acceso_autorizado"] = False
+                st.rerun()
 
 
 if __name__ == "__main__":
