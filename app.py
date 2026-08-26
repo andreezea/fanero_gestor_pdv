@@ -1452,24 +1452,21 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
             (df_hist_mes_ant["Departamento"].isin(departamentos_activos)) & (df_hist_mes_ant["Producto"] == "Prepago")
         ]["Avance"].sum()
         var_total_pct = ((m0_total - m1_total) / m1_total) if m1_total > 0 else (1.0 if m0_total > 0 else 0.0)
-        m1_display = f"{m1_total:,.0f}"
-        var_display = f"{var_total_pct:+.1%}"
+        m0_m1_delta = f"M-1: {m1_total:,.0f} ({var_total_pct:+.1%})"
     else:
-        m1_display = "—"
-        var_display = None
+        m0_m1_delta = "M-1: — (sin histórico aún)"
 
     df_filtrado = df[df["Departamento"].isin(departamentos_activos) & df["Producto"].isin(productos_sel)]
 
     if df_filtrado.empty:
-        cols_vacio = st.columns(8)
+        cols_vacio = st.columns(7)
         cols_vacio[0].metric("Gestores", "0")
         cols_vacio[1].metric("PDV", "0")
         cols_vacio[2].metric("Cuota total", "0")
         cols_vacio[3].metric("Avance", "0")
         cols_vacio[4].metric("Proyección", "0")
-        cols_vacio[5].metric("M0 (Prepago)", f"{m0_total:,.0f}")
-        cols_vacio[6].metric("M-1 (Prepago)", m1_display, var_display)
-        cols_vacio[7].metric("💰 Comisión total estimada", "S/ 0")
+        cols_vacio[5].metric("M0 (Prepago)", f"{m0_total:,.0f}", m0_m1_delta)
+        cols_vacio[6].metric("💰 Comisión total estimada", "S/ 0")
         st.info("No hay datos para el filtro de Producto seleccionado (M0/M-1 arriba son de Prepago y no dependen de este filtro).")
         return
 
@@ -1487,15 +1484,14 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         include_groups=False,
     ).sum()
 
-    col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     col1.metric("Gestores", f"{df_filtrado['DNI'].nunique():,}")
     col2.metric("PDV", f"{df_filtrado['PDV'].nunique():,}")
     col3.metric("Cuota total", f"{cuota_total:,.0f}")
     col4.metric("Avance", f"{avance_total:,.0f}", f"{cumplimiento:.1%}")
     col5.metric("Proyección", f"{proy_total:,.0f}", f"{proy_pct:.1%}")
-    col6.metric("M0 (Prepago)", f"{m0_total:,.0f}")
-    col7.metric("M-1 (Prepago)", m1_display, var_display)
-    col8.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
+    col6.metric("M0 (Prepago)", f"{m0_total:,.0f}", m0_m1_delta)
+    col7.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
     if df_hist_mes_ant is None:
         st.caption("M-1 aparecerá disponible en cuanto se publique el mes siguiente (la app archiva cada mes automáticamente).")
 
