@@ -1297,10 +1297,37 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         productos_sel = PRODUCTOS
     departamentos_activos = departamentos_filtro if departamentos_filtro else sorted(df["Departamento"].unique())
 
+    # M0 / M-1 son SIEMPRE sobre Prepago, independientemente del filtro de
+    # Producto — por eso se calculan ANTES del filtro por Producto y del
+    # "return" temprano si ese filtro deja la tabla vacía.
+    anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
+    df_hist_mes_ant = obtener_historico_mes(mes_ant, anio_ant)
+
+    m0_total = df[(df["Departamento"].isin(departamentos_activos)) & (df["Producto"] == "Prepago")]["Avance"].sum()
+    if df_hist_mes_ant is not None:
+        m1_total = df_hist_mes_ant[
+            (df_hist_mes_ant["Departamento"].isin(departamentos_activos)) & (df_hist_mes_ant["Producto"] == "Prepago")
+        ]["Avance"].sum()
+        var_total_pct = ((m0_total - m1_total) / m1_total) if m1_total > 0 else (1.0 if m0_total > 0 else 0.0)
+        m1_display = f"{m1_total:,.0f}"
+        var_display = f"{var_total_pct:+.1%}"
+    else:
+        m1_display = "—"
+        var_display = None
+
     df_filtrado = df[df["Departamento"].isin(departamentos_activos) & df["Producto"].isin(productos_sel)]
 
     if df_filtrado.empty:
-        st.info("No hay datos para los filtros seleccionados.")
+        cols_vacio = st.columns(8)
+        cols_vacio[0].metric("Gestores", "0")
+        cols_vacio[1].metric("PDV", "0")
+        cols_vacio[2].metric("Cuota total", "0")
+        cols_vacio[3].metric("Avance", "0")
+        cols_vacio[4].metric("Proyección", "0")
+        cols_vacio[5].metric("M0 (Prepago)", f"{m0_total:,.0f}")
+        cols_vacio[6].metric("M-1 (Prepago)", m1_display, var_display)
+        cols_vacio[7].metric("💰 Comisión total estimada", "S/ 0")
+        st.info("No hay datos para el filtro de Producto seleccionado (M0/M-1 arriba son de Prepago y no dependen de este filtro).")
         return
 
     # --- KPIs generales sobre lo filtrado ---
@@ -1317,13 +1344,17 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         include_groups=False,
     ).sum()
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
     col1.metric("Gestores", f"{df_filtrado['DNI'].nunique():,}")
     col2.metric("PDV", f"{df_filtrado['PDV'].nunique():,}")
     col3.metric("Cuota total", f"{cuota_total:,.0f}")
     col4.metric("Avance", f"{avance_total:,.0f}", f"{cumplimiento:.1%}")
     col5.metric("Proyección", f"{proy_total:,.0f}", f"{proy_pct:.1%}")
-    col6.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
+    col6.metric("M0 (Prepago)", f"{m0_total:,.0f}")
+    col7.metric("M-1 (Prepago)", m1_display, var_display)
+    col8.metric("💰 Comisión total estimada", f"S/ {comision_total_estimada:,.0f}")
+    if df_hist_mes_ant is None:
+        st.caption("M-1 aparecerá disponible en cuanto se publique el mes siguiente (la app archiva cada mes automáticamente).")
 
     st.markdown("---")
     titulo = f"Resumen por Producto · agrupado por {agrupar_por}"
@@ -1385,7 +1416,11 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
 
     st.markdown("---")
     st.markdown("#### 📈 Comparativo mensual (Prepago): M0 vs M-1")
-    comparativo, hay_historico = tabla_comparativo_mensual(df_filtrado, mes, anio, agrupar_por)
+    # Igual que arriba: el comparativo M0/M-1 es siempre sobre Prepago, así
+    # que se calcula sobre el Departamento filtrado, sin aplicar el filtro
+    # de Producto (que podría excluir Prepago de la tabla por error).
+    df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
+    comparativo, hay_historico = tabla_comparativo_mensual(df_scope_depto, mes, anio, agrupar_por)
     if not hay_historico:
         st.info(
             "Todavía no hay histórico del mes anterior guardado (esto es normal en el primer mes "
@@ -1403,68 +1438,41 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     )
 
 
-def _credenciales_visualizacion() -> tuple[str, str]:
-    """Usuario/clave compartido para poder VER el dashboard (distinto del
-    admin, que solo puede publicar datos). Configurar en Streamlit Cloud →
-    Settings → Secrets:
-
-    [visualizacion]
-    usuario = "..."
-    password = "..."
-    """
-    try:
-        return st.secrets["visualizacion"]["usuario"], st.secrets["visualizacion"]["password"]
-    except Exception:  # noqa: BLE001 - no hay secrets configurados aún
-        return "fanero", "fanero2026"
-
-
-def verificar_acceso_general() -> bool:
-    """Login ÚNICO (un solo link, sin parámetros en la URL). Revisa las
-    credenciales contra [admin] y [visualizacion] en Secrets:
-    - Si coincide con [admin] → sesión de administrador (ve además el
-      panel de carga en la barra lateral).
-    - Si coincide con [visualizacion] → sesión de solo lectura.
-    """
-    if st.session_state.get("es_admin", False) or st.session_state.get("acceso_autorizado", False):
-        return True
-
-    st.title("📊 Mi Cartera - Gestores Fanero")
-    st.caption("Ingresa tus credenciales para continuar.")
-
-    with st.form("form_login_general"):
-        usuario = st.text_input("Usuario")
-        clave = st.text_input("Contraseña", type="password")
-        enviar = st.form_submit_button("Ingresar")
-
-    if enviar:
-        usuario_admin, clave_admin = _credenciales_admin()
-        usuario_vista, clave_vista = _credenciales_visualizacion()
-
-        if usuario == usuario_admin and clave == clave_admin:
-            st.session_state["es_admin"] = True
-            st.session_state["acceso_autorizado"] = True
+def render_acceso_admin_sidebar() -> None:
+    """Acceso admin discreto en la barra lateral — el dashboard es público
+    y no requiere login para verse. Solo quien conoce las credenciales admin
+    puede iniciar sesión ahí para publicar datos."""
+    if st.session_state.get("es_admin", False):
+        panel_admin()
+        st.markdown("---")
+        if st.button("Cerrar sesión"):
+            st.session_state["es_admin"] = False
             st.rerun()
-        elif usuario == usuario_vista and clave == clave_vista:
-            st.session_state["acceso_autorizado"] = True
-            st.rerun()
-        else:
-            st.error("Usuario o contraseña incorrectos.")
+        return
 
-    return False
+    with st.expander("🔒 Administrador"):
+        with st.form("form_login_admin"):
+            usuario = st.text_input("Usuario")
+            clave = st.text_input("Contraseña", type="password")
+            enviar = st.form_submit_button("Ingresar")
+
+        if enviar:
+            usuario_ok, clave_ok = _credenciales_admin()
+            if usuario == usuario_ok and clave == clave_ok:
+                st.session_state["es_admin"] = True
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos.")
 
 
 def main():
-    # Un solo login (sin parámetros en la URL): según las credenciales,
-    # queda como admin o como visualización. Nada se renderiza hasta que
-    # inicie sesión.
-    if not verificar_acceso_general():
-        return
-
+    # El dashboard es público (no requiere login para verse). El acceso
+    # admin vive discretamente en la barra lateral, para quien necesite
+    # publicar datos.
     st.title("📊 Mi Cartera - Gestores Fanero")
 
-    if st.session_state.get("es_admin", False):
-        with st.sidebar:
-            panel_admin()
+    with st.sidebar:
+        render_acceso_admin_sidebar()
 
     df_raw, dia_corte, mes, anio = obtener_datos_publicados()
     dias_en_mes = calendar.monthrange(anio, mes)[1]
@@ -1495,13 +1503,6 @@ def main():
     with tabs[2]:
         st.subheader("Editar Avances")
         panel_editar_avances(df_raw)
-
-    with st.sidebar:
-        st.markdown("---")
-        if st.button("Cerrar sesión"):
-            st.session_state["es_admin"] = False
-            st.session_state["acceso_autorizado"] = False
-            st.rerun()
 
 
 if __name__ == "__main__":
