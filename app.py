@@ -21,11 +21,15 @@ Estructura del archivo:
     6. Edición de avances por gestor (acceso restringido)
     7. Interfaz principal (main): Mi Cartera (Gestor) + Vista Gerencial
 
-Accesos ocultos (se mantienen igual que en la versión anterior):
-    ?admin=1   → panel de administrador: publica el archivo Excel completo
-                 (con día de corte, mes y año).
-    ?editar=1  → pestaña "Editar Avances": cada gestor actualiza el avance
-                 de sus propios PDV, sin tocar los de otros gestores.
+Acceso (un solo link, sin parámetros en la URL):
+    La app pide un único login (usuario + contraseña) configurado en
+    Secrets. Según qué credencial coincida, la sesión queda como:
+    - [admin]        → además del dashboard, ve el panel para publicar datos
+                       (barra lateral).
+    - [visualizacion]→ solo ve el dashboard (Mi Cartera, Vista Gerencial,
+                       Editar Avances).
+    Ver `_credenciales_admin` / `_credenciales_visualizacion` para configurar
+    las claves reales en Streamlit Cloud → Settings → Secrets.
 
 Lógica de proyección (igual que la versión anterior; Cuota y Avance son
 unidades, no montos en dinero):
@@ -35,9 +39,11 @@ unidades, no montos en dinero):
     Cuota diaria necesaria = (Cuota - Avance) / Días restantes
 
 Carga de datos del administrador:
-    El administrador sube un Excel con Cuota y Avance (acumulado del mes
-    hasta la fecha de corte declarada), indica Mes/Año/Día de corte, y
-    publica. Cada publicación REEMPLAZA por completo lo que se veía antes.
+    El administrador sube un Excel con el Avance del día/periodo más
+    reciente; la app lo SUMA automáticamente al acumulado del mes (ver
+    `publicar_datos_incremental`). Al cambiar de Mes/Año, el acumulado se
+    reinicia solo y el mes saliente se archiva para poder comparar
+    M0 vs M-1 en Vista Gerencial.
 
 Listo para desplegar en Streamlit Cloud: `streamlit run app.py`
 """
@@ -62,7 +68,11 @@ st.set_page_config(
     page_title="Mi Cartera - Gestores Fanero",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    # "auto": Streamlit la expande sola si detecta contenido en la sidebar
+    # (el panel admin, una vez logueado). Antes estaba "collapsed" a
+    # propósito para ocultar el acceso admin vía URL secreta — ya no aplica,
+    # ahora el acceso admin depende del login, no de que la sidebar esté oculta.
+    initial_sidebar_state="auto",
 )
 
 DATA_DIR = "data"
@@ -814,25 +824,10 @@ def _credenciales_admin() -> tuple[str, str]:
 
 
 def panel_admin() -> None:
-    """Renderiza el control de acceso y la carga de datos. Solo se llama
-    cuando la URL incluye ?admin=1."""
+    """Contenido del panel administrador (subir/publicar datos). Se llama
+    SOLO cuando ya se inició sesión como admin desde el login general — no
+    tiene su propio formulario de acceso ni botón de cerrar sesión."""
     st.header("🔒 Panel administrador")
-
-    if not st.session_state.get("es_admin", False):
-        with st.form("form_login_admin"):
-            usuario = st.text_input("Usuario")
-            clave = st.text_input("Contraseña", type="password")
-            enviar = st.form_submit_button("Ingresar")
-
-        if enviar:
-            usuario_ok, clave_ok = _credenciales_admin()
-            if usuario == usuario_ok and clave == clave_ok:
-                st.session_state["es_admin"] = True
-                st.rerun()
-            else:
-                st.error("Usuario o contraseña incorrectos.")
-        return
-
     st.success("Sesión de administrador activa.")
 
     st.download_button(
@@ -895,10 +890,6 @@ def panel_admin() -> None:
     if os.path.exists(DATA_FILE):
         ultima_actualizacion = datetime.fromtimestamp(os.path.getmtime(DATA_FILE))
         st.caption(f"Última publicación: {ultima_actualizacion:%d/%m/%Y %H:%M}")
-
-    if st.button("Cerrar sesión"):
-        st.session_state["es_admin"] = False
-        st.rerun()
 
 
 # =============================================================================
@@ -1428,15 +1419,17 @@ def _credenciales_visualizacion() -> tuple[str, str]:
 
 
 def verificar_acceso_general() -> bool:
-    """Muestra un login simple antes de dejar ver el dashboard. Si ya se
-    inició sesión como administrador (panel_admin), no se pide de nuevo."""
-    if st.session_state.get("es_admin", False):
-        return True
-    if st.session_state.get("acceso_autorizado", False):
+    """Login ÚNICO (un solo link, sin parámetros en la URL). Revisa las
+    credenciales contra [admin] y [visualizacion] en Secrets:
+    - Si coincide con [admin] → sesión de administrador (ve además el
+      panel de carga en la barra lateral).
+    - Si coincide con [visualizacion] → sesión de solo lectura.
+    """
+    if st.session_state.get("es_admin", False) or st.session_state.get("acceso_autorizado", False):
         return True
 
     st.title("📊 Mi Cartera - Gestores Fanero")
-    st.caption("Ingresa tus credenciales para ver el dashboard.")
+    st.caption("Ingresa tus credenciales para continuar.")
 
     with st.form("form_login_general"):
         usuario = st.text_input("Usuario")
@@ -1444,8 +1437,14 @@ def verificar_acceso_general() -> bool:
         enviar = st.form_submit_button("Ingresar")
 
     if enviar:
-        usuario_ok, clave_ok = _credenciales_visualizacion()
-        if usuario == usuario_ok and clave == clave_ok:
+        usuario_admin, clave_admin = _credenciales_admin()
+        usuario_vista, clave_vista = _credenciales_visualizacion()
+
+        if usuario == usuario_admin and clave == clave_admin:
+            st.session_state["es_admin"] = True
+            st.session_state["acceso_autorizado"] = True
+            st.rerun()
+        elif usuario == usuario_vista and clave == clave_vista:
             st.session_state["acceso_autorizado"] = True
             st.rerun()
         else:
@@ -1455,19 +1454,17 @@ def verificar_acceso_general() -> bool:
 
 
 def main():
-    # El panel admin (?admin=1) se renderiza SIEMPRE, incluso sin haber
-    # iniciado sesión de visualización, para que el administrador pueda
-    # loguearse de forma independiente.
-    if st.query_params.get("admin") == "1":
-        with st.sidebar:
-            panel_admin()
-
+    # Un solo login (sin parámetros en la URL): según las credenciales,
+    # queda como admin o como visualización. Nada se renderiza hasta que
+    # inicie sesión.
     if not verificar_acceso_general():
         return
 
     st.title("📊 Mi Cartera - Gestores Fanero")
 
-    mostrar_editor = st.query_params.get("editar") == "1"
+    if st.session_state.get("es_admin", False):
+        with st.sidebar:
+            panel_admin()
 
     df_raw, dia_corte, mes, anio = obtener_datos_publicados()
     dias_en_mes = calendar.monthrange(anio, mes)[1]
@@ -1487,10 +1484,7 @@ def main():
 
     df = calcular_metricas(df_raw, dias_en_mes, dia_corte)
 
-    tab_names = ["👤 Mi Cartera (Gestor)", "🏢 Vista Gerencial"]
-    if mostrar_editor:
-        tab_names.append("✏️ Editar Avances")
-    tabs = st.tabs(tab_names)
+    tabs = st.tabs(["👤 Mi Cartera (Gestor)", "🏢 Vista Gerencial", "✏️ Editar Avances"])
 
     with tabs[0]:
         vista_gestor(df, dias_en_mes, dia_corte, dias_restantes)
@@ -1498,17 +1492,16 @@ def main():
     with tabs[1]:
         vista_gerencial(df, dias_en_mes, dia_corte, mes, anio)
 
-    if mostrar_editor:
-        with tabs[2]:
-            st.subheader("Editar Avances")
-            panel_editar_avances(df_raw)
+    with tabs[2]:
+        st.subheader("Editar Avances")
+        panel_editar_avances(df_raw)
 
     with st.sidebar:
-        if st.session_state.get("acceso_autorizado", False) and not st.session_state.get("es_admin", False):
-            st.markdown("---")
-            if st.button("Cerrar sesión"):
-                st.session_state["acceso_autorizado"] = False
-                st.rerun()
+        st.markdown("---")
+        if st.button("Cerrar sesión"):
+            st.session_state["es_admin"] = False
+            st.session_state["acceso_autorizado"] = False
+            st.rerun()
 
 
 if __name__ == "__main__":
