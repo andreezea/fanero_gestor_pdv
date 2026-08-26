@@ -702,17 +702,42 @@ def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
             return "color: #3E9B4F; font-weight: 600" if v >= 0 else "color: #D64545; font-weight: 600"
         styler = styler.map(_color_var, subset=[("M0 vs M-1", "%Var")])
 
-    # Centra todo el contenido de la tabla (números y encabezados).
-    styler = styler.set_properties(**{"text-align": "center"})
-    styler = styler.set_table_styles([{"selector": "th", "props": [("text-align", "center")]}], overwrite=False)
-
     # Resalta la fila "Fanero (Total)" en negrita, si está presente.
     if "Fanero (Total)" in tabla.index:
         def _negrita_total(fila):
             return ["font-weight: 700" if fila.name == "Fanero (Total)" else "" for _ in fila]
         styler = styler.apply(_negrita_total, axis=1)
 
+    # Bordes + centrado. Esto solo se ve completo cuando la tabla se
+    # renderiza como HTML (ver `renderizar_tabla_centrada`) — el widget
+    # interactivo st.dataframe NO respeta text-align de un Styler, por eso
+    # esta tabla en particular se muestra con st.markdown(unsafe_allow_html).
+    styler = styler.set_table_styles(
+        [
+            {"selector": "table", "props": [("border-collapse", "collapse"), ("width", "100%"), ("font-size", "0.85rem")]},
+            {"selector": "th, td", "props": [("border", "1px solid #E2E4F0"), ("padding", "6px 10px"), ("text-align", "center")]},
+            {"selector": "th", "props": [("background-color", "#F5F6FB"), ("font-weight", "600")]},
+        ],
+        overwrite=True,
+    )
+    styler = styler.set_properties(**{"text-align": "center"})
+
     return styler
+
+
+def renderizar_tabla_centrada(styler, altura: str | int = "content") -> None:
+    """Renderiza un Styler como HTML puro (st.markdown unsafe_allow_html),
+    en vez de st.dataframe — necesario para que el centrado de texto (y
+    cualquier otro CSS del Styler) se vea de verdad, ya que el widget
+    interactivo st.dataframe ignora text-align. Se pierde el buscador nativo
+    y el ordenamiento por columna del widget interactivo; se mantiene la
+    descarga a CSV por separado."""
+    html = styler.to_html()
+    if isinstance(altura, int):
+        contenedor = f'<div style="overflow:auto; max-height:{altura}px; border:1px solid #E2E4F0; border-radius:6px;">{html}</div>'
+    else:
+        contenedor = f'<div style="overflow-x:auto;">{html}</div>'
+    st.markdown(contenedor, unsafe_allow_html=True)
 
 
 def ranking_gestores(df_filtrado: pd.DataFrame) -> pd.DataFrame:
@@ -1569,11 +1594,11 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
             mascara.loc["Fanero (Total)"] = True
         tabla = tabla[mascara]
 
-    altura = 480 if desagrupar else "content"
     if tabla.empty:
         st.info("No hay filas para el Rango de Cumplimiento seleccionado.")
     else:
-        st.dataframe(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), width="stretch", height=altura)
+        altura_render = 480 if desagrupar else "content"
+        renderizar_tabla_centrada(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), altura_render)
     leyenda = "🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Proy %)"
     if not desagrupar:
         leyenda += " · M0 = venta Prepago este mes · M-1 = venta Prepago mes anterior"
