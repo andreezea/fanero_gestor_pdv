@@ -291,6 +291,19 @@ _MAPA_DEPARTAMENTO_CANONICO = {_normalizar_texto_simple(d): d for d in DEPARTAME
 _MAPA_PRODUCTO_CANONICO = {_normalizar_texto_simple(p): p for p in PRODUCTOS}
 
 
+# Columnas que deben leerse SIEMPRE como texto: si un DNI o código de PDV
+# tiene ceros a la izquierda (ej. "05336082"), pandas los interpreta como
+# número al leer el Excel y los pierde ("5336082") — dtype=str lo evita.
+_COLUMNAS_FORZAR_TEXTO = {"DNI": str, "PDV": str}
+
+
+def leer_excel_seguro(ruta_o_archivo, **kwargs) -> pd.DataFrame:
+    """Envoltorio de pd.read_excel que fuerza DNI/PDV como texto (evita
+    perder ceros a la izquierda). Si el archivo no tiene esas columnas,
+    pandas simplemente las ignora, sin error."""
+    return pd.read_excel(ruta_o_archivo, dtype=_COLUMNAS_FORZAR_TEXTO, **kwargs)
+
+
 def _normalizar_identidad(df: pd.DataFrame) -> pd.DataFrame:
     """Aplica la normalización de texto a todas las columnas de identidad.
     Además, homogeneiza Departamento y Producto a su forma canónica sin
@@ -357,7 +370,7 @@ def cargar_datos_excel(archivo) -> pd.DataFrame | None:
     """Lee y valida un archivo Excel cargado por el administrador.
     Retorna None (y muestra un error en la UI) si faltan columnas requeridas."""
     try:
-        df = pd.read_excel(archivo)
+        df = leer_excel_seguro(archivo)
     except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
         st.error(f"No se pudo leer el archivo Excel: {exc}")
         return None
@@ -374,7 +387,7 @@ def cargar_datos_excel(archivo) -> pd.DataFrame | None:
 def _leer_excel_publicado(path: str, mtime: float) -> pd.DataFrame:
     """Lee el Excel publicado. `mtime` forma parte de la clave de cache: si
     cambia el archivo, el cache se invalida automáticamente."""
-    df = pd.read_excel(path)
+    df = leer_excel_seguro(path)
     return _normalizar_identidad(df)
 
 
@@ -426,7 +439,7 @@ def obtener_historico_mes(mes: int, anio: int) -> pd.DataFrame | None:
     existe (por ejemplo, el primer mes usando la app, antes de tener historial)."""
     ruta = os.path.join(HISTORICO_DIR, f"{anio}_{mes:02d}.xlsx")
     if os.path.exists(ruta):
-        return _normalizar_identidad(pd.read_excel(ruta))
+        return _normalizar_identidad(leer_excel_seguro(ruta))
     return None
 
 
@@ -520,7 +533,7 @@ def registrar_incremento_diario(df_incremento: pd.DataFrame, fecha: "pd.Timestam
     agregado["Fecha"] = pd.Timestamp(fecha)
 
     if os.path.exists(HISTORIAL_DIARIO_FILE):
-        historial = pd.read_excel(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
+        historial = leer_excel_seguro(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
         historial["DNI"] = historial["DNI"].astype(str).str.strip()  # evita que Excel lo lea como número
         agregado["DNI"] = agregado["DNI"].astype(str).str.strip()
         claves = ["Fecha", "DNI", "Producto"]
@@ -541,7 +554,7 @@ def obtener_historial_diario() -> pd.DataFrame:
     hay ninguna publicación registrada."""
     if os.path.exists(HISTORIAL_DIARIO_FILE):
         try:
-            df = pd.read_excel(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
+            df = leer_excel_seguro(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
             df["DNI"] = df["DNI"].astype(str).str.strip()
             return df
         except Exception:  # noqa: BLE001 - archivo corrupto
@@ -664,7 +677,7 @@ def cargar_visitas_bo() -> pd.DataFrame:
     renombra sola para no perder los datos ya guardados."""
     if os.path.exists(VISITAS_FILE):
         try:
-            df = pd.read_excel(VISITAS_FILE)
+            df = leer_excel_seguro(VISITAS_FILE)
             df["DNI"] = df["DNI"].astype(str).str.strip()
             if "Visitas Promedio" in df.columns and "Visitas PDV" not in df.columns:
                 df = df.rename(columns={"Visitas Promedio": "Visitas PDV"})
@@ -1352,6 +1365,84 @@ def _credenciales_admin() -> tuple[str, str]:
         return "admin", "admin2025"
 
 
+def procesar_carga_horizontal_diaria(
+    df_horizontal: pd.DataFrame, producto: str, mes: int, anio: int,
+) -> tuple[int, list[int]]:
+    """Convierte una plantilla HORIZONTAL (una columna por día del mes, con
+    el nombre de columna = número de día: 1, 2, 3... 31) en publicaciones
+    diarias reales, reutilizando exactamente la misma lógica de
+    `publicar_datos_incremental` (suma al acumulado, archiva historial
+    diario) — así el resultado es idéntico a haber publicado día por día,
+    pero en un solo archivo.
+
+    Columnas esperadas: DNI, Nombre, Departamento, Provincia, Distrito, PDV,
+    Nombre PDV, y luego una columna por cada día con la venta de ESE día
+    (no acumulada). La Cuota no viene en este archivo — se conserva la que
+    ya esté publicada para ese DNI+PDV+Producto (si no existe ninguna
+    todavía, queda en 0 y se puede corregir luego con la plantilla normal).
+
+    Devuelve (cantidad_de_dias_procesados, lista_de_dias_omitidos_por_vacios).
+    """
+    columnas_identidad = ["DNI", "Nombre", "Departamento", "Provincia", "Distrito", "PDV", "Nombre PDV"]
+    faltantes = [c for c in columnas_identidad if c not in df_horizontal.columns]
+    if faltantes:
+        raise ValueError("Faltan columnas de identidad: " + ", ".join(faltantes))
+
+    columnas_dia = []
+    for col in df_horizontal.columns:
+        if col in columnas_identidad:
+            continue
+        try:
+            numero_dia = int(col)
+            if 1 <= numero_dia <= 31:
+                columnas_dia.append((numero_dia, col))
+        except (ValueError, TypeError):
+            continue
+
+    if not columnas_dia:
+        raise ValueError(
+            "No se encontró ninguna columna de día (deben llamarse 1, 2, 3... 31, "
+            "una por cada día del mes)."
+        )
+    columnas_dia.sort(key=lambda t: t[0])
+
+    df_horizontal = _normalizar_identidad(df_horizontal)
+
+    # Cuota: se toma de lo ya publicado para ese DNI+PDV+Producto (si existe).
+    cuota_existente = {}
+    if os.path.exists(DATA_FILE):
+        df_actual, _, _, _ = obtener_datos_publicados()
+        df_actual_prod = df_actual[df_actual["Producto"] == producto]
+        cuota_existente = {
+            (fila["DNI"], fila["PDV"]): fila["Cuota"] for _, fila in df_actual_prod.iterrows()
+        }
+
+    dias_procesados = 0
+    dias_omitidos = []
+
+    for numero_dia, nombre_columna in columnas_dia:
+        columnas_a_tomar = columnas_identidad + [nombre_columna]
+        df_dia = df_horizontal[columnas_a_tomar].rename(columns={nombre_columna: "Avance"})
+        df_dia["Avance"] = pd.to_numeric(df_dia["Avance"], errors="coerce")
+        df_dia = df_dia.dropna(subset=["Avance"])
+
+        if df_dia.empty:
+            dias_omitidos.append(numero_dia)
+            continue
+
+        df_dia["Producto"] = producto
+        df_dia["Cuota"] = df_dia.apply(
+            lambda fila: cuota_existente.get((fila["DNI"], fila["PDV"]), 0.0), axis=1
+        )
+
+        ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
+        dia_corte_valido = min(numero_dia, ultimo_dia_mes)
+        publicar_datos_incremental(df_dia, dia_corte=dia_corte_valido, mes=mes, anio=anio)
+        dias_procesados += 1
+
+    return dias_procesados, dias_omitidos
+
+
 def panel_admin() -> None:
     """Contenido del panel administrador (subir/publicar datos). Se llama
     SOLO cuando ya se inició sesión como admin desde el login general — no
@@ -1444,7 +1535,7 @@ def panel_admin() -> None:
 
     if archivo_historico is not None and st.button("Guardar como histórico"):
         try:
-            df_ancho = pd.read_excel(archivo_historico)
+            df_ancho = leer_excel_seguro(archivo_historico)
         except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
             st.error(f"No se pudo leer el archivo: {exc}")
             df_ancho = None
@@ -1463,6 +1554,53 @@ def panel_admin() -> None:
                 meses_nombres = {v: k for k, v in MESES_ES.items() if k not in ("setiembre",)}
                 meses_guardados = ", ".join(meses_nombres.get(m, str(m)) for m in sorted(resultados.keys()))
                 st.success(f"Histórico guardado para: {meses_guardados} de {int(anio_historico)}.")
+
+    st.markdown("---")
+    st.markdown("#### 📅 Cargar ventas diarias (formato horizontal)")
+    st.caption(
+        "Alternativa a subir un archivo por día: una sola tabla con una columna por cada día del "
+        "mes (nombradas 1, 2, 3... 31), con la venta de ESE día en cada celda (no acumulada). "
+        "La app publica automáticamente día por día, en orden, igual que si hubieras subido un "
+        "archivo distinto cada día."
+    )
+    st.code("DNI | Nombre | Departamento | Provincia | Distrito | PDV | Nombre PDV | 1 | 2 | 3 | ... | 31", language=None)
+    st.caption("La Cuota no va en este archivo: se conserva la que ya esté publicada para cada PDV+Producto.")
+
+    col_prod_h, col_mes_h, col_anio_h = st.columns(3)
+    with col_prod_h:
+        producto_horizontal = st.selectbox("Producto de este archivo", PRODUCTOS, key="producto_horizontal")
+    with col_mes_h:
+        mes_horizontal = st.number_input("Mes", min_value=1, max_value=12, value=datetime.now().month, key="mes_horizontal")
+    with col_anio_h:
+        anio_horizontal = st.number_input(
+            "Año", min_value=2020, max_value=2100, value=datetime.now().year, step=1, key="anio_horizontal",
+        )
+
+    archivo_horizontal = st.file_uploader(
+        "Excel de ventas diarias (formato horizontal)", type=["xlsx"], key="uploader_horizontal_diario",
+    )
+
+    if archivo_horizontal is not None and st.button("Procesar y publicar ventas diarias"):
+        try:
+            df_horizontal = leer_excel_seguro(archivo_horizontal)
+        except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
+            st.error(f"No se pudo leer el archivo: {exc}")
+            df_horizontal = None
+
+        if df_horizontal is not None:
+            try:
+                dias_ok, dias_omitidos = procesar_carga_horizontal_diaria(
+                    df_horizontal, producto_horizontal, int(mes_horizontal), int(anio_horizontal),
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                dias_ok, dias_omitidos = 0, []
+
+            if dias_ok > 0:
+                mensaje = f"Se publicaron {dias_ok} día(s) de {producto_horizontal} para {int(mes_horizontal)}/{int(anio_horizontal)}."
+                if dias_omitidos:
+                    mensaje += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos))}."
+                st.success(mensaje)
 
 
 # =============================================================================
@@ -1639,7 +1777,7 @@ def panel_editar_avances(df_raw: pd.DataFrame) -> None:
 
     if archivo_avances is not None and st.button("Guardar cambios del archivo", key="guardar_avances_archivo"):
         try:
-            df_subido = pd.read_excel(archivo_avances)
+            df_subido = leer_excel_seguro(archivo_avances)
         except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
             st.error(f"No se pudo leer el archivo: {exc}")
             df_subido = None
@@ -1874,9 +2012,41 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
             "Producto", options=PRODUCTOS, default=PRODUCTOS, key="producto_gerencial",
         )
 
+    # Fila de 3 filtros adicionales: DNI del líder (PDV), Provincia, Distrito.
+    col_e, col_f, col_g = st.columns(3)
+    with col_e:
+        opciones_pdv = sorted(
+            (df["PDV"] + " · " + df["Nombre PDV"]).unique(),
+        )
+        pdv_filtro_sel = st.multiselect(
+            "DNI del líder (PDV)", options=opciones_pdv, default=[], key="pdv_filtro_gerencial",
+        )
+    with col_f:
+        provincia_filtro_sel = st.multiselect(
+            "Provincia", options=sorted(df["Provincia"].unique()), default=[], key="provincia_filtro_gerencial",
+        )
+    with col_g:
+        distrito_filtro_sel = st.multiselect(
+            "Distrito", options=sorted(df["Distrito"].unique()), default=[], key="distrito_filtro_gerencial",
+        )
+
     if not productos_sel:
         productos_sel = PRODUCTOS
     departamentos_activos = departamentos_filtro if departamentos_filtro else sorted(df["Departamento"].unique())
+
+    # Aplica los 3 filtros adicionales a TODO lo que sigue (KPIs, tabla,
+    # M0/M-1 y gráfico) — igual que el resto de filtros de esta vista.
+    if pdv_filtro_sel:
+        codigos_pdv_filtro = {v.split(" · ")[0] for v in pdv_filtro_sel}
+        df = df[df["PDV"].isin(codigos_pdv_filtro)]
+    if provincia_filtro_sel:
+        df = df[df["Provincia"].isin(provincia_filtro_sel)]
+    if distrito_filtro_sel:
+        df = df[df["Distrito"].isin(distrito_filtro_sel)]
+
+    if df.empty:
+        st.info("No hay datos para la combinación de filtros seleccionada (PDV/Provincia/Distrito).")
+        return
 
     # M0 / M-1 son SIEMPRE sobre Prepago, independientemente del filtro de
     # Producto. Se calculan aquí y se agregan como columnas adicionales al
