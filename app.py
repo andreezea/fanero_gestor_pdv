@@ -601,13 +601,21 @@ def construir_tabla_comisiones(
 ) -> pd.DataFrame:
     """Tabla de cálculo de comisiones: una fila por Gestor (+ fila "Fanero"
     con el total), con Cuota/Avance/Proy Unidades/Proy% para Prepago y
-    Postpago, y una comisión calculada por producto:
+    Postpago, y una comisión calculada por producto.
 
-        Comisión_producto = Proy%_producto (con tope TOPE_PROY_PCT_COMISION) * MONTO_COMISION_PRODUCTO[producto]
-
-    La Proy Unidades de PREPAGO se multiplica antes por el %Visitas del
-    gestor (mapa_pct_visitas), que viene de PDV Totales / Visitas Promedio
-    ingresados por el BO.
+    Orden de cálculo (importante, no cambiar el orden):
+    1. Avance = venta real acumulada, TAL CUAL viene del archivo (no se toca).
+    2. Proy Unidades = Avance * (días del mes / día de corte) — proyección
+       normal, sin ningún ajuste. Esto es lo que se MUESTRA en la tabla.
+    3. Proy % = Proy Unidades / Cuota, con tope de TOPE_PROY_PCT_COMISION
+       (110% por defecto) — aplica a Prepago y Postpago por igual.
+    4. SOLO para Prepago: el Proy% (ya con el tope aplicado) se multiplica
+       por el %Visitas del gestor (Visitas Promedio / PDV Totales, ingresado
+       por el BO). Este ajuste es al PORCENTAJE, nunca a las Unidades — así
+       la Proy Unidades que se ve en pantalla siempre refleja la proyección
+       real, y el impacto de las visitas se ve reflejado en el % y en la
+       comisión resultante, no distorsiona el número de unidades.
+    5. Comisión_producto = Proy% (ya ajustado) * MONTO_COMISION_PRODUCTO[producto].
     """
     df_prod = df_filtrado[df_filtrado["Producto"].isin(PRODUCTOS_COMISION)].copy()
     factor_proyeccion = dias_en_mes / max(dia_corte, 1)
@@ -616,16 +624,20 @@ def construir_tabla_comisiones(
         df_prod.groupby(["DNI", "Nombre", "Producto"], as_index=False)
         .agg(Cuota=("Cuota", "sum"), Avance=("Avance", "sum"))
     )
+    # Proyección normal, SIN ajustar — esto es lo que se muestra en "Proy Unidades".
     agregado["Proy Unidades"] = agregado["Avance"] * factor_proyeccion
-
-    # Ajuste por % de visitas — SOLO para Prepago.
-    es_prepago = agregado["Producto"] == "Prepago"
-    pct_visitas_fila = agregado["DNI"].map(mapa_pct_visitas).fillna(1.0)
-    agregado.loc[es_prepago, "Proy Unidades"] = agregado.loc[es_prepago, "Proy Unidades"] * pct_visitas_fila[es_prepago]
-
     agregado["Proy %"] = np.where(agregado["Cuota"] > 0, agregado["Proy Unidades"] / agregado["Cuota"], 0.0)
     agregado["Proy %"] = agregado["Proy %"].clip(upper=TOPE_PROY_PCT_COMISION)
-    agregado["Comision"] = agregado["Producto"].map(MONTO_COMISION_PRODUCTO) * agregado["Proy %"]
+
+    # El ajuste por %Visitas se aplica al % (no a las unidades), y SOLO a
+    # Prepago — se usa una columna separada "Proy % Comisión" para no perder
+    # el Proy% "real" que se muestra en la tabla.
+    agregado["Proy % Comisión"] = agregado["Proy %"]
+    es_prepago = agregado["Producto"] == "Prepago"
+    pct_visitas_fila = agregado["DNI"].map(mapa_pct_visitas).fillna(1.0)
+    agregado.loc[es_prepago, "Proy % Comisión"] = agregado.loc[es_prepago, "Proy %"] * pct_visitas_fila[es_prepago]
+
+    agregado["Comision"] = agregado["Producto"].map(MONTO_COMISION_PRODUCTO) * agregado["Proy % Comisión"]
 
     metricas = ["Cuota", "Avance", "Proy Unidades", "Proy %"]
     pivot = agregado.pivot_table(index=["DNI", "Nombre"], columns="Producto", values=metricas, aggfunc="first")
@@ -643,8 +655,13 @@ def construir_tabla_comisiones(
     tabla.index.name = "Gestor"
     tabla = tabla.sort_index()
 
-    # --- Fila "Fanero": totales reales, Proy% recalculado con tope sobre el
-    # total (no promedio de filas), Comisión recalculada sobre ese % total. ---
+    # --- Fila "Fanero": Cuota/Avance/Proy Unidades/Proy% son la suma/​
+    # recálculo real de TODOS los gestores (sin ajuste de visitas, para que
+    # el % sea comparable entre departamentos). La Comisión, en cambio, es
+    # la SUMA de las comisiones individuales ya ajustadas por visitas —
+    # es el número financieramente correcto (lo que realmente se paga en
+    # total), aunque no se derive exactamente de multiplicar el Proy% de
+    # esta fila por el monto (porque cada gestor tiene su propio %Visitas). ---
     fila_total = {}
     for p in PRODUCTOS_COMISION:
         cuota_p = tabla[(p, "Cuota")].sum()
@@ -655,7 +672,7 @@ def construir_tabla_comisiones(
         fila_total[(p, "Avance")] = avance_p
         fila_total[(p, "Proy Unidades")] = proy_p
         fila_total[(p, "Proy %")] = proy_pct_p
-        fila_total[("Comisión", p)] = proy_pct_p * MONTO_COMISION_PRODUCTO[p]
+        fila_total[("Comisión", p)] = tabla[("Comisión", p)].sum()
     fila_total[("Comisión", "Total")] = sum(fila_total[("Comisión", p)] for p in PRODUCTOS_COMISION)
 
     df_total = pd.DataFrame([fila_total], index=["Fanero"], columns=tabla.columns)
