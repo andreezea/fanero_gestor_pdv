@@ -561,22 +561,26 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
     return resultados
 
 def registrar_incremento_diario(df_incremento: pd.DataFrame, fecha: "pd.Timestamp") -> None:
-    """Guarda, con fecha, lo que se sumó en ESTA publicación (por Gestor y
-    Producto) — es la base para el gráfico de 'Ventas diarias' en Vista
-    Gerencial. Si ya existía un registro para esa misma Fecha+DNI+Producto
-    (se volvió a publicar el mismo día), se reemplaza en vez de duplicar."""
-    columnas = ["DNI", "Nombre", "Departamento", "Producto"]
+    """Guarda, con fecha, lo que se sumó en ESTA publicación (por Gestor,
+    PDV y Producto) — es la base para el gráfico de 'Ventas diarias' y para
+    la comparación M0 vs M-1 'mismo día contra mismo día'. Si ya existía un
+    registro para esa misma Fecha+DNI+PDV+Producto (se volvió a publicar el
+    mismo día), se reemplaza en vez de duplicar."""
+    columnas = ["DNI", "Nombre", "Departamento", "PDV", "Producto"]
     columnas_presentes = [c for c in columnas if c in df_incremento.columns]
     agregado = (
         df_incremento.groupby(columnas_presentes, as_index=False)["Avance"].sum()
     )
     agregado["Fecha"] = pd.Timestamp(fecha)
 
+    claves = ["Fecha", "DNI", "Producto"] + (["PDV"] if "PDV" in columnas_presentes else [])
+
     if os.path.exists(HISTORIAL_DIARIO_FILE):
         historial = leer_excel_seguro(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
         historial["DNI"] = historial["DNI"].astype(str).str.strip()  # evita que Excel lo lea como número
         agregado["DNI"] = agregado["DNI"].astype(str).str.strip()
-        claves = ["Fecha", "DNI", "Producto"]
+        if "PDV" in claves and "PDV" not in historial.columns:
+            historial["PDV"] = ""  # archivo viejo sin columna PDV: se completa vacía
         historial = historial.set_index(claves)
         nuevo = agregado.set_index(claves)
         historial = historial.drop(index=historial.index.intersection(nuevo.index), errors="ignore")
@@ -600,6 +604,54 @@ def obtener_historial_diario() -> pd.DataFrame:
         except Exception:  # noqa: BLE001 - archivo corrupto
             pass
     return pd.DataFrame(columns=["Fecha", "DNI", "Nombre", "Departamento", "Producto", "Avance"])
+
+
+def hay_detalle_diario_del_mes(mes: int, anio: int) -> bool:
+    """True si el historial diario tiene AL MENOS un registro de ese
+    Mes/Año — permite decidir si se puede hacer la comparación 'mismo día
+    contra mismo día', o si hay que usar el total del mes completo."""
+    historial = obtener_historial_diario()
+    if historial.empty:
+        return False
+    return not historial[(historial["Fecha"].dt.year == anio) & (historial["Fecha"].dt.month == mes)].empty
+
+
+def avance_acumulado_hasta_dia(
+    mes: int, anio: int, dia_corte: int, departamentos_activos: list, producto: str,
+) -> float:
+    """Suma el historial diario de un Mes/Año, para un Producto y un
+    conjunto de Departamentos, SOLO hasta el día `dia_corte` (inclusive) —
+    es la base para comparar M0 vs M-1 'mismo día contra mismo día' en vez
+    de mes completo contra mes completo. Devuelve 0 si no hay registros."""
+    historial = obtener_historial_diario()
+    if historial.empty:
+        return 0.0
+    filtro = (
+        (historial["Fecha"].dt.year == anio) & (historial["Fecha"].dt.month == mes)
+        & (historial["Fecha"].dt.day <= dia_corte)
+        & (historial["Departamento"].isin(departamentos_activos))
+        & (historial["Producto"] == producto)
+    )
+    return float(historial[filtro]["Avance"].sum())
+
+
+def avance_acumulado_hasta_dia_por_pdv(mes: int, anio: int, dia_corte: int, producto: str) -> pd.Series:
+    """Como `avance_acumulado_hasta_dia`, pero devuelve una Serie indexada
+    por código de PDV (para la comparación M0 vs M-1 desagrupada por PDV).
+    Los registros sin PDV (archivos históricos de antes de este cambio) se
+    ignoran — no se pueden comparar a nivel PDV, solo a nivel Departamento/Gestor."""
+    historial = obtener_historial_diario()
+    if historial.empty or "PDV" not in historial.columns:
+        return pd.Series(dtype=float)
+    filtro = (
+        (historial["Fecha"].dt.year == anio) & (historial["Fecha"].dt.month == mes)
+        & (historial["Fecha"].dt.day <= dia_corte) & (historial["Producto"] == producto)
+        & (historial["PDV"].astype(str).str.strip() != "")
+    )
+    subset = historial[filtro]
+    if subset.empty:
+        return pd.Series(dtype=float)
+    return subset.groupby("PDV")["Avance"].sum()
 
 
 def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> None:
@@ -1494,6 +1546,110 @@ def procesar_carga_horizontal_diaria(
     return dias_procesados, dias_omitidos
 
 
+def procesar_carga_horizontal_historica(
+    df_horizontal: pd.DataFrame, producto: str, mes: int, anio: int, df_referencia: pd.DataFrame,
+) -> tuple[int, list[int]]:
+    """Igual que `procesar_carga_horizontal_diaria`, pero para un MES
+    ANTERIOR (histórico) — nunca toca `ultima_carga.xlsx` (los datos del
+    mes en curso). Solo alimenta:
+    1. `historial_diario` (día por día), para poder comparar M0 vs M-1
+       "mismo día contra mismo día".
+    2. El archivo mensual archivado (`data/historico/AAAA_MM.xlsx`), con
+       el total del mes completo — para que la comparación de mes
+       completo siga funcionando igual que antes.
+
+    Columnas esperadas (igual esquema que la plantilla de M-1, pero con
+    columnas de día en vez de una sola columna "Mes"):
+
+        DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | 1 | 2 | 3 | ... | 31
+
+    Obligatorias: "DNI PDV", "DNI Gestor", y al menos una columna de día.
+    Departamento/Provincia/Distrito/Nombre PDV son opcionales pero muy
+    recomendadas (mismo criterio que `procesar_carga_historico_ancho`).
+    """
+    columnas_obligatorias = {"DNI PDV", "DNI Gestor"}
+    faltantes_obligatorias = columnas_obligatorias - set(df_horizontal.columns)
+    if faltantes_obligatorias:
+        raise ValueError("Faltan columnas obligatorias: " + ", ".join(sorted(faltantes_obligatorias)))
+
+    df_horizontal = df_horizontal.copy()
+    df_horizontal["PDV"] = df_horizontal["DNI PDV"].astype(str).str.strip()
+    df_horizontal["DNI"] = df_horizontal["DNI Gestor"].astype(str).str.strip()
+    sin_gestor_conocido = df_horizontal["DNI"].isna() | (df_horizontal["DNI"].isin(["", "nan", "None"]))
+    df_horizontal.loc[sin_gestor_conocido, "DNI"] = "SIN_GESTOR"
+
+    columnas_geo_presentes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c in df_horizontal.columns]
+    columnas_excluir = {"DNI PDV", "DNI Gestor", "PDV", "DNI"} | set(columnas_geo_presentes)
+
+    columnas_dia = []
+    for col in df_horizontal.columns:
+        if col in columnas_excluir:
+            continue
+        try:
+            numero_dia = int(col)
+            ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
+            if 1 <= numero_dia <= ultimo_dia_mes:
+                columnas_dia.append((numero_dia, col))
+        except (ValueError, TypeError):
+            continue
+
+    if not columnas_dia:
+        raise ValueError(
+            "No se encontró ninguna columna de día válida para ese mes (deben llamarse "
+            "1, 2, 3... según corresponda)."
+        )
+    columnas_dia.sort(key=lambda t: t[0])
+
+    # Respaldo por DNI Gestor para geo faltante (mismo criterio que la carga
+    # ancha de M-1) y Nombre del gestor con placeholder si no se encuentra.
+    columnas_geo_faltantes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c not in columnas_geo_presentes]
+    ref_cols = [c for c in (["DNI"] + columnas_geo_faltantes + ["Nombre"]) if c in df_referencia.columns]
+    ref = df_referencia[ref_cols].drop_duplicates(subset=["DNI"]) if "DNI" in ref_cols and len(ref_cols) > 1 else pd.DataFrame(columns=["DNI"])
+
+    dias_procesados = 0
+    dias_omitidos = []
+    filas_totales_mes = []
+
+    for numero_dia, nombre_columna in columnas_dia:
+        columnas_a_tomar = ["DNI", "PDV"] + columnas_geo_presentes + [nombre_columna]
+        df_dia = df_horizontal[columnas_a_tomar].rename(columns={nombre_columna: "Avance"})
+        df_dia["Avance"] = pd.to_numeric(df_dia["Avance"], errors="coerce")
+        df_dia = df_dia.dropna(subset=["Avance"])
+
+        if df_dia.empty:
+            dias_omitidos.append(numero_dia)
+            continue
+
+        df_dia["Producto"] = producto
+        if not ref.empty:
+            df_dia = df_dia.merge(ref, on="DNI", how="left")
+
+        if "Nombre" not in df_dia.columns:
+            df_dia["Nombre"] = ""
+        df_dia["Nombre"] = df_dia["Nombre"].fillna("")
+        es_sin_gestor = df_dia["DNI"] == "SIN_GESTOR"
+        df_dia.loc[es_sin_gestor & (df_dia["Nombre"] == ""), "Nombre"] = "Sin gestor asignado"
+        sin_nombre = df_dia["Nombre"] == ""
+        df_dia.loc[sin_nombre, "Nombre"] = "Gestor " + df_dia.loc[sin_nombre, "DNI"]
+
+        df_dia = _normalizar_identidad(df_dia)
+
+        fecha_dia = pd.Timestamp(year=anio, month=mes, day=numero_dia)
+        registrar_incremento_diario(df_dia, fecha_dia)
+        filas_totales_mes.append(df_dia)
+        dias_procesados += 1
+
+    if filas_totales_mes:
+        df_mes_completo = pd.concat(filas_totales_mes, ignore_index=True)
+        df_mes_completo = (
+            df_mes_completo.groupby(["DNI", "Nombre", "Departamento", "Provincia", "Distrito", "PDV", "Nombre PDV", "Producto"], as_index=False)
+            ["Avance"].sum()
+        )
+        _archivar_mes(df_mes_completo, mes, anio)
+
+    return dias_procesados, dias_omitidos
+
+
 def panel_admin() -> None:
     """Contenido del panel administrador (subir/publicar datos). Se llama
     SOLO cuando ya se inició sesión como admin desde el login general — no
@@ -1683,6 +1839,70 @@ def panel_admin() -> None:
                 if dias_omitidos:
                     mensaje += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos))}."
                 st.success(mensaje)
+
+    st.markdown("---")
+    st.markdown("#### 📅➕ Cargar ventas diarias de un MES ANTERIOR (histórico)")
+    st.caption(
+        "Para poder comparar M0 vs M-1 'mismo día contra mismo día' en Vista Gerencial, en vez del "
+        "total del mes completo. Esta carga NO toca los datos del mes en curso — solo alimenta el "
+        "histórico. Mismo formato que la carga de M-1, pero con una columna por día en vez de una "
+        "sola columna 'Mes':"
+    )
+    st.code(
+        "DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | 1 | 2 | 3 | ... | 31",
+        language=None,
+    )
+    st.caption(
+        "Obligatorias: **DNI PDV**, **DNI Gestor**, y al menos una columna de día. "
+        "Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas — si las "
+        "omites, se completan buscando el DNI Gestor en lo ya publicado este mes (y si tampoco se "
+        "encuentra ahí, quedan vacías)."
+    )
+
+    col_prod_hh, col_mes_hh, col_anio_hh = st.columns(3)
+    with col_prod_hh:
+        producto_hist_horizontal = st.selectbox("Producto de este archivo", PRODUCTOS, key="producto_hist_horizontal")
+    with col_mes_hh:
+        mes_hist_horizontal = st.number_input(
+            "Mes (el mes anterior, no el actual)", min_value=1, max_value=12, value=datetime.now().month,
+            key="mes_hist_horizontal",
+        )
+    with col_anio_hh:
+        anio_hist_horizontal = st.number_input(
+            "Año", min_value=2020, max_value=2100, value=datetime.now().year, step=1, key="anio_hist_horizontal",
+        )
+
+    archivo_hist_horizontal = st.file_uploader(
+        "Excel de ventas diarias históricas (formato horizontal)", type=["xlsx"], key="uploader_hist_horizontal",
+    )
+
+    if archivo_hist_horizontal is not None and st.button("Procesar histórico diario"):
+        try:
+            df_hist_horizontal = leer_excel_seguro(archivo_hist_horizontal)
+        except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
+            st.error(f"No se pudo leer el archivo: {exc}")
+            df_hist_horizontal = None
+
+        if df_hist_horizontal is not None:
+            df_referencia_hist, _, _, _ = obtener_datos_publicados()
+            try:
+                dias_ok_h, dias_omitidos_h = procesar_carga_horizontal_historica(
+                    df_hist_horizontal, producto_hist_horizontal,
+                    int(mes_hist_horizontal), int(anio_hist_horizontal), df_referencia_hist,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                dias_ok_h, dias_omitidos_h = 0, []
+
+            if dias_ok_h > 0:
+                mensaje_h = (
+                    f"Se guardó el histórico diario de {producto_hist_horizontal} para "
+                    f"{int(mes_hist_horizontal)}/{int(anio_hist_horizontal)} ({dias_ok_h} día(s)). "
+                    "Los datos del mes en curso NO se modificaron."
+                )
+                if dias_omitidos_h:
+                    mensaje_h += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos_h))}."
+                st.success(mensaje_h)
 
 
 # =============================================================================
@@ -2004,20 +2224,26 @@ def aplicar_estilo_detalle_plano(tabla: pd.DataFrame):
     return _aplicar_semaforo(styler, columnas_semaforo)
 
 
-def tabla_comparativo_mensual(df_filtrado: pd.DataFrame, mes: int, anio: int, agrupar_por: str) -> tuple[pd.DataFrame, bool]:
+def tabla_comparativo_mensual(
+    df_filtrado: pd.DataFrame, mes: int, anio: int, agrupar_por: str, dia_corte: int | None = None,
+) -> tuple[pd.DataFrame, bool]:
     """Construye la tabla M0 (venta Prepago del mes actual) vs M-1 (venta
-    Prepago del mismo Departamento/Gestor el mes anterior, según el
-    histórico archivado) y %Var. Devuelve (tabla, hay_historico) — si no hay
-    histórico del mes anterior (por ejemplo, el primer mes usando la app),
-    hay_historico=False y M-1/%Var quedan vacíos en vez de mostrar '0%'
-    engañoso.
+    Prepago del mismo Departamento/Gestor el mes anterior) y %Var.
+
+    Si hay detalle diario del mes anterior (se cargó con la plantilla
+    horizontal histórica) y se pasa `dia_corte`, M-1 se calcula "mismo día
+    contra mismo día" (acumulado del mes anterior hasta ese mismo número de
+    día) — la comparación más justa. Si no hay detalle diario, cae de
+    vuelta al total del mes anterior completo (el comportamiento anterior).
+
+    Devuelve (tabla, hay_historico) — hay_historico=False solo si no hay
+    NINGÚN dato del mes anterior (ni detalle diario ni total archivado).
 
     Para Gestor, se agrupa internamente por DNI (clave única, evita mezclar
     dos gestores con el mismo nombre) y el resultado se muestra con el
     Nombre — igual criterio que `construir_tabla_producto`, para que ambas
     tablas se puedan unir (join) por el mismo índice."""
     anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
-    df_hist = obtener_historico_mes(mes_ant, anio_ant)
 
     clave_col = "Departamento" if agrupar_por == "Departamento" else "DNI"
     nombre_indice = "Departamento" if agrupar_por == "Departamento" else "Gestor"
@@ -2025,14 +2251,29 @@ def tabla_comparativo_mensual(df_filtrado: pd.DataFrame, mes: int, anio: int, ag
     df_prepago = df_filtrado[df_filtrado["Producto"] == "Prepago"].copy()
     m0 = df_prepago.groupby(clave_col)["Avance"].sum().rename("M0")
 
-    if df_hist is None:
+    usar_mismo_dia = dia_corte is not None and hay_detalle_diario_del_mes(mes_ant, anio_ant)
+
+    if usar_mismo_dia:
+        historial = obtener_historial_diario()
+        filtro = (
+            (historial["Fecha"].dt.year == anio_ant) & (historial["Fecha"].dt.month == mes_ant)
+            & (historial["Fecha"].dt.day <= dia_corte) & (historial["Producto"] == "Prepago")
+        )
+        m1 = historial[filtro].groupby(clave_col)["Avance"].sum().rename("M-1")
+        df_hist = obtener_historico_mes(mes_ant, anio_ant)  # solo para completar Nombre de Gestor si falta
+    else:
+        df_hist = obtener_historico_mes(mes_ant, anio_ant)
+        if df_hist is not None:
+            df_prepago_hist = df_hist[df_hist["Producto"] == "Prepago"].copy()
+            m1 = df_prepago_hist.groupby(clave_col)["Avance"].sum().rename("M-1")
+        else:
+            m1 = None
+
+    if m1 is None:
         comparativo = m0.to_frame()
         comparativo["M-1"] = np.nan
         comparativo["%Var"] = np.nan
     else:
-        df_prepago_hist = df_hist[df_hist["Producto"] == "Prepago"].copy()
-        m1 = df_prepago_hist.groupby(clave_col)["Avance"].sum().rename("M-1")
-
         comparativo = pd.concat([m0, m1], axis=1)
         comparativo["M0"] = comparativo["M0"].fillna(0)
         comparativo["M-1"] = comparativo["M-1"].fillna(0)
@@ -2054,11 +2295,11 @@ def tabla_comparativo_mensual(df_filtrado: pd.DataFrame, mes: int, anio: int, ag
         comparativo.index = [dni_a_nombre.get(i, i) for i in comparativo.index]
 
     comparativo.index.name = nombre_indice
-    return comparativo.sort_values("M0", ascending=False), (df_hist is not None)
+    return comparativo.sort_values("M0", ascending=False), (m1 is not None)
 
 
 def tabla_comparativo_mensual_pdv(
-    df_filtrado: pd.DataFrame, mes: int, anio: int, agrupar_por: str,
+    df_filtrado: pd.DataFrame, mes: int, anio: int, agrupar_por: str, dia_corte: int | None = None,
 ) -> tuple[pd.DataFrame, bool]:
     """Versión a nivel PDV de `tabla_comparativo_mensual`: M0 vs M-1 de
     Prepago, pero una fila por (nivel, PDV) en vez de una fila por nivel.
@@ -2075,9 +2316,12 @@ def tabla_comparativo_mensual_pdv(
     simplemente no aparecen aquí (esta tabla se arma sobre los PDV
     ACTIVOS de este mes) — sí se cuentan igual en el M-1 departamental,
     ver `tabla_comparativo_mensual`.
+
+    Si hay detalle diario del mes anterior (plantilla horizontal
+    histórica) y se pasa `dia_corte`, M-1 se calcula "mismo día contra
+    mismo día" por PDV — si no, cae de vuelta al total del mes anterior.
     """
     anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
-    df_hist = obtener_historico_mes(mes_ant, anio_ant)
 
     nivel_col = "Departamento" if agrupar_por == "Departamento" else "DNI"
     nombre_nivel = "Departamento" if agrupar_por == "Departamento" else "Gestor"
@@ -2094,26 +2338,43 @@ def tabla_comparativo_mensual_pdv(
     df_prepago = _con_clave_pdv(df_filtrado[df_filtrado["Producto"] == "Prepago"])
     m0 = df_prepago.groupby([nivel_col, "_PDV"])["Avance"].sum().rename("M0")
 
-    if df_hist is None:
-        comparativo = m0.to_frame()
-        comparativo["M-1"] = np.nan
-        comparativo["%Var"] = np.nan
-        hay_historico = False
-    else:
-        df_prepago_hist = _con_clave_pdv(df_hist[df_hist["Producto"] == "Prepago"])
-        m1_por_pdv = df_prepago_hist.groupby("_PDV")["Avance"].sum()
+    usar_mismo_dia = dia_corte is not None and hay_detalle_diario_del_mes(mes_ant, anio_ant)
 
-        # El M-1 se busca SOLO por código de PDV (no por nivel): así, si un
-        # PDV cambió de Gestor/Departamento entre un mes y otro, igual se
-        # encuentra su venta real del mes pasado.
+    if usar_mismo_dia:
+        m1_por_pdv_codigo = avance_acumulado_hasta_dia_por_pdv(mes_ant, anio_ant, dia_corte, "Prepago")
         comparativo = m0.to_frame()
-        comparativo["M-1"] = [m1_por_pdv.get(pdv, 0.0) for _, pdv in comparativo.index]
+        comparativo["M-1"] = [
+            m1_por_pdv_codigo.get(pdv.split(" · ")[0], 0.0) for _, pdv in comparativo.index
+        ]
         comparativo["%Var"] = np.where(
             comparativo["M-1"] > 0,
             (comparativo["M0"] - comparativo["M-1"]) / comparativo["M-1"],
             np.where(comparativo["M0"] > 0, 1.0, 0.0),
         )
         hay_historico = True
+        df_hist = obtener_historico_mes(mes_ant, anio_ant)  # solo para completar Nombre de Gestor
+    else:
+        df_hist = obtener_historico_mes(mes_ant, anio_ant)
+        if df_hist is None:
+            comparativo = m0.to_frame()
+            comparativo["M-1"] = np.nan
+            comparativo["%Var"] = np.nan
+            hay_historico = False
+        else:
+            df_prepago_hist = _con_clave_pdv(df_hist[df_hist["Producto"] == "Prepago"])
+            m1_por_pdv = df_prepago_hist.groupby("_PDV")["Avance"].sum()
+
+            # El M-1 se busca SOLO por código de PDV (no por nivel): así, si un
+            # PDV cambió de Gestor/Departamento entre un mes y otro, igual se
+            # encuentra su venta real del mes pasado.
+            comparativo = m0.to_frame()
+            comparativo["M-1"] = [m1_por_pdv.get(pdv, 0.0) for _, pdv in comparativo.index]
+            comparativo["%Var"] = np.where(
+                comparativo["M-1"] > 0,
+                (comparativo["M0"] - comparativo["M-1"]) / comparativo["M-1"],
+                np.where(comparativo["M0"] > 0, 1.0, 0.0),
+            )
+            hay_historico = True
 
     if agrupar_por == "Gestor":
         dni_a_nombre = df_filtrado.drop_duplicates("DNI").set_index("DNI")["Nombre"].to_dict()
@@ -2204,17 +2465,24 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     # Producto. Se calculan aquí y se agregan como columnas adicionales al
     # final de la tabla principal (después de OSS), no como tarjeta aparte.
     anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
-    df_hist_mes_ant = obtener_historico_mes(mes_ant, anio_ant)
 
     m0_total = df[(df["Departamento"].isin(departamentos_activos)) & (df["Producto"] == "Prepago")]["Avance"].sum()
-    if df_hist_mes_ant is not None:
-        m1_total = df_hist_mes_ant[
-            (df_hist_mes_ant["Departamento"].isin(departamentos_activos)) & (df_hist_mes_ant["Producto"] == "Prepago")
-        ]["Avance"].sum()
+
+    if hay_detalle_diario_del_mes(mes_ant, anio_ant):
+        # "Mismo día contra mismo día": la comparación más justa, disponible
+        # cuando el mes anterior se cargó con la plantilla horizontal histórica.
+        m1_total = avance_acumulado_hasta_dia(mes_ant, anio_ant, dia_corte, departamentos_activos, "Prepago")
         var_total_pct = ((m0_total - m1_total) / m1_total) if m1_total > 0 else (1.0 if m0_total > 0 else 0.0)
     else:
-        m1_total = np.nan
-        var_total_pct = np.nan
+        df_hist_mes_ant = obtener_historico_mes(mes_ant, anio_ant)
+        if df_hist_mes_ant is not None:
+            m1_total = df_hist_mes_ant[
+                (df_hist_mes_ant["Departamento"].isin(departamentos_activos)) & (df_hist_mes_ant["Producto"] == "Prepago")
+            ]["Avance"].sum()
+            var_total_pct = ((m0_total - m1_total) / m1_total) if m1_total > 0 else (1.0 if m0_total > 0 else 0.0)
+        else:
+            m1_total = np.nan
+            var_total_pct = np.nan
 
     df_filtrado = df[df["Departamento"].isin(departamentos_activos) & df["Producto"].isin(productos_sel)]
 
@@ -2267,7 +2535,7 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     # queda con M-1 = 0; uno que ya no sigue simplemente no aparece aquí. ---
     if not desagrupar:
         df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
-        comparativo, hay_historico = tabla_comparativo_mensual(df_scope_depto, mes, anio, agrupar_por)
+        comparativo, hay_historico = tabla_comparativo_mensual(df_scope_depto, mes, anio, agrupar_por, dia_corte)
         fila_total_comp = pd.DataFrame(
             [{"M0": m0_total, "M-1": m1_total, "%Var": var_total_pct}], index=["Fanero"]
         )
@@ -2276,7 +2544,7 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         tabla = tabla.join(comparativo, how="left")
     else:
         df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
-        comparativo, hay_historico = tabla_comparativo_mensual_pdv(df_scope_depto, mes, anio, agrupar_por)
+        comparativo, hay_historico = tabla_comparativo_mensual_pdv(df_scope_depto, mes, anio, agrupar_por, dia_corte)
         comparativo.columns = pd.MultiIndex.from_tuples([("M0 vs M-1", c) for c in comparativo.columns])
         tabla = tabla.join(comparativo, how="left")
         # Un PDV nuevo este mes (sin fila en el histórico) debe verse como
@@ -2328,7 +2596,11 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         altura_render = 480 if desagrupar else "content"
         renderizar_tabla_centrada(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), altura_render)
     leyenda = "🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Proy %)"
-    leyenda += " · M0 = venta Prepago este mes · M-1 = venta Prepago mes anterior"
+    anio_ant_leyenda, mes_ant_leyenda = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
+    if hay_detalle_diario_del_mes(mes_ant_leyenda, anio_ant_leyenda):
+        leyenda += f" · M0 = Prepago hasta el día {dia_corte} este mes · M-1 = Prepago hasta el MISMO día ({dia_corte}) el mes anterior"
+    else:
+        leyenda += " · M0 = venta Prepago este mes · M-1 = venta Prepago TOTAL del mes anterior (sin detalle diario, no es 'mismo día')"
     if desagrupar:
         leyenda += " (por PDV: nuevo este mes = M-1 en 0)"
     st.caption(leyenda)
