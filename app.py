@@ -2437,6 +2437,10 @@ def main():
     with col_logo:
         if os.path.exists(LOGO_PATH):
             st.image(LOGO_PATH, width=140)
+        else:
+            # Avisa en vez de fallar en silencio — suele pasar si al subir
+            # el proyecto se copió app.py pero no la carpeta assets/.
+            st.caption("⚠️ Logo no encontrado (falta la carpeta `assets/` en el repositorio).")
     with col_titulo:
         st.title("📊 Mi Cartera - Gestores Fanero")
 
