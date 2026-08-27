@@ -371,6 +371,8 @@ def cargar_datos_excel(archivo) -> pd.DataFrame | None:
     """Lee y valida un archivo Excel cargado por el administrador.
     Retorna None (y muestra un error en la UI) si faltan columnas requeridas."""
     try:
+        if hasattr(archivo, "seek"):
+            archivo.seek(0)  # por si ya se leyó antes (ej. para la vista previa)
         df = leer_excel_seguro(archivo)
     except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
         st.error(f"No se pudo leer el archivo Excel: {exc}")
@@ -1540,8 +1542,26 @@ def panel_admin() -> None:
 
     forzar_reemplazo = st.checkbox(
         "⚠️ Esta carga REEMPLAZA todo lo publicado, en vez de sumarlo "
-        "(úsalo solo para corregir un error de carga)."
+        "(úsalo solo para corregir un error de carga, o si tu archivo trae el acumulado total del mes)."
     )
+
+    if archivo is not None:
+        df_preview = cargar_datos_excel(archivo)
+        if df_preview is not None and not forzar_reemplazo:
+            avance_nuevo = df_preview["Avance"].sum()
+            avance_actual = 0.0
+            if os.path.exists(DATA_FILE):
+                df_actual_preview, _, mes_actual_preview, anio_actual_preview = obtener_datos_publicados()
+                if int(mes_actual_preview) == int(mes_sel) and int(anio_actual_preview) == int(anio_sel):
+                    avance_actual = df_actual_preview["Avance"].sum()
+            st.info(
+                f"📊 **Vista previa:** este archivo suma **{avance_nuevo:,.0f}** unidades de Avance. "
+                f"En modo SUMAR (el de arriba, sin marcar), el acumulado del mes pasaría de "
+                f"**{avance_actual:,.0f}** a **{avance_actual + avance_nuevo:,.0f}**.\n\n"
+                "⚠️ Si tu archivo trae el **acumulado total hasta hoy** (no solo lo vendido en el día/periodo "
+                "más reciente), esto va a duplicar tus ventas — en ese caso, marca la casilla de REEMPLAZAR "
+                "arriba, o pon Avance = 0 si solo quieres actualizar la Cuota."
+            )
 
     if archivo is not None and st.button("Publicar datos"):
         df_validado = cargar_datos_excel(archivo)
