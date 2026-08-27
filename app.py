@@ -58,6 +58,7 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 from openpyxl import Workbook
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -485,6 +486,12 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
     df_ancho = df_ancho.copy()
     df_ancho["PDV"] = df_ancho["DNI PDV"].astype(str).str.strip()
     df_ancho["DNI"] = df_ancho["DNI Gestor"].astype(str).str.strip()
+    # Si no se conoce el DNI Gestor de un PDV (celda vacía), se agrupa bajo
+    # un "gestor" placeholder claro — así el Departamento sigue sumando bien
+    # (no depende del Gestor), y en la Vista Gerencial por Gestor aparece
+    # una fila legible "Sin gestor asignado" en vez de una fila en blanco.
+    sin_gestor_conocido = df_ancho["DNI"].isna() | (df_ancho["DNI"].isin(["", "nan", "None"]))
+    df_ancho.loc[sin_gestor_conocido, "DNI"] = "SIN_GESTOR"
     df_ancho["_MesTexto"] = df_ancho["Mes"].astype(str).str.strip().str.lower()
     df_ancho["_MesNumero"] = df_ancho["_MesTexto"].map(MESES_ES)
 
@@ -537,9 +544,13 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
         # El Nombre del gestor no viene en esta plantilla: si tampoco se
         # encontró en lo ya publicado, se usa un nombre genérico legible en
         # vez de dejarlo vacío (evita filas "sin nombre" en la tabla).
+        # "SIN_GESTOR" (DNI Gestor vacío en el archivo) tiene su propio
+        # nombre claro, distinto del genérico "Gestor <DNI>".
         if "Nombre" not in df_largo.columns:
             df_largo["Nombre"] = ""
         df_largo["Nombre"] = df_largo["Nombre"].fillna("")
+        es_sin_gestor = df_largo["DNI"] == "SIN_GESTOR"
+        df_largo.loc[es_sin_gestor & (df_largo["Nombre"] == ""), "Nombre"] = "Sin gestor asignado"
         sin_nombre = df_largo["Nombre"] == ""
         df_largo.loc[sin_nombre, "Nombre"] = "Gestor " + df_largo.loc[sin_nombre, "DNI"]
 
@@ -2308,9 +2319,13 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
 
     st.markdown("---")
     st.markdown("#### 📈 Ventas diarias")
+
+    producto_base_grafico = producto_base_para_rango(productos_sel)
     st.caption(
-        "Se arma a partir de lo que se suma en cada publicación del admin. Necesita al menos 2 "
-        "publicaciones en días distintos dentro del mes para verse; con 1 sola carga no hay 'diario' que graficar."
+        f"Muestra **{producto_base_grafico}** (si tienes los 4 productos elegidos, se grafica Prepago por "
+        "defecto — elige un solo producto distinto arriba para ver ese en su lugar). Se arma a partir de "
+        "lo que se suma en cada publicación del admin: necesita al menos 2 publicaciones en días distintos "
+        "dentro del mes para verse; con 1 sola carga no hay 'diario' que graficar."
     )
 
     historial = obtener_historial_diario()
@@ -2318,7 +2333,7 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         historial_mes = historial[
             (historial["Fecha"].dt.year == anio) & (historial["Fecha"].dt.month == mes)
             & (historial["Departamento"].isin(departamentos_activos))
-            & (historial["Producto"].isin(productos_sel))
+            & (historial["Producto"] == producto_base_grafico)
         ]
     else:
         historial_mes = historial
@@ -2326,18 +2341,30 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     if historial_mes.empty:
         st.info("Todavía no hay suficientes publicaciones registradas este mes para graficar ventas diarias.")
     else:
-        if agrupar_por == "Departamento":
-            pivote_diario = (
-                historial_mes.groupby(["Fecha", "Departamento"])["Avance"].sum().unstack("Departamento").fillna(0)
+        historial_mes = historial_mes.copy()
+        col_grupo = "Departamento" if agrupar_por == "Departamento" else "Nombre"
+        datos_grafico = (
+            historial_mes.groupby(["Fecha", col_grupo], as_index=False)["Avance"].sum()
+        )
+        datos_grafico = datos_grafico.rename(columns={col_grupo: agrupar_por})
+
+        grafico = (
+            alt.Chart(datos_grafico)
+            .mark_line(strokeWidth=3.5, point=alt.OverlayMarkDef(size=45))
+            .encode(
+                x=alt.X("Fecha:T", title="Fecha", axis=alt.Axis(format="%d/%m", labelAngle=0)),
+                y=alt.Y("Avance:Q", title=f"Venta diaria ({producto_base_grafico})"),
+                color=alt.Color(f"{agrupar_por}:N", title=agrupar_por),
+                tooltip=[
+                    alt.Tooltip("Fecha:T", title="Fecha", format="%d/%m/%Y"),
+                    alt.Tooltip(f"{agrupar_por}:N", title=agrupar_por),
+                    alt.Tooltip("Avance:Q", title="Venta", format=",.0f"),
+                ],
             )
-        else:
-            historial_mes = historial_mes.copy()
-            historial_mes["_Gestor"] = historial_mes["Nombre"]
-            pivote_diario = (
-                historial_mes.groupby(["Fecha", "_Gestor"])["Avance"].sum().unstack("_Gestor").fillna(0)
-            )
-        pivote_diario = pivote_diario.sort_index()
-        st.line_chart(pivote_diario)
+            .properties(height=420)
+            .interactive()
+        )
+        st.altair_chart(grafico, width="stretch")
         st.caption(f"Ventas registradas por publicación, agrupadas por {agrupar_por.lower()} — no es un conteo transaccional día por día, sino lo sumado en cada carga del admin.")
 
 
