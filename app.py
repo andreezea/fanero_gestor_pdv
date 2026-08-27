@@ -574,7 +574,9 @@ def construir_tabla_producto(
     - agrupar_por="Departamento" → una fila por Departamento (o por
       Departamento + PDV si desagrupar=True).
     - agrupar_por="Gestor" → una fila por Gestor (o por Gestor + PDV si
-      desagrupar=True).
+      desagrupar=True). Internamente se agrupa por DNI (para no mezclar dos
+      gestores distintos que compartan nombre), pero la fila se muestra
+      SOLO con el Nombre, sin el DNI.
 
     Cuando NO se desagrupa, se agrega una fila "Fanero" al final
     con la suma de TODO lo que esté en df_filtrado (todos los departamentos
@@ -582,14 +584,15 @@ def construir_tabla_producto(
     los totales, no se promedian filas.
     """
     df_filtrado = df_filtrado.copy()
-    df_filtrado["_Gestor"] = df_filtrado["Nombre"] + " · DNI " + df_filtrado["DNI"]
     df_filtrado["_PDV"] = np.where(
         df_filtrado["Nombre PDV"] != "",
         df_filtrado["PDV"] + " · " + df_filtrado["Nombre PDV"],
         df_filtrado["PDV"],
     )
 
-    nivel_col = "Departamento" if agrupar_por == "Departamento" else "_Gestor"
+    # Para Gestor, se agrupa por DNI (clave única) — el nombre se aplica
+    # recién al final, solo para mostrar.
+    nivel_col = "Departamento" if agrupar_por == "Departamento" else "DNI"
     index_cols = [nivel_col] + (["_PDV"] if desagrupar else [])
 
     largo = (
@@ -638,10 +641,34 @@ def construir_tabla_producto(
         ancho = ancho.reindex(columns=columnas_orden).sort_index(level=0)
 
     nombre_nivel = "Departamento" if agrupar_por == "Departamento" else "Gestor"
-    if desagrupar:
-        ancho.index = ancho.index.set_names([nombre_nivel, "PDV"])
+
+    if agrupar_por == "Gestor":
+        # Reemplaza el DNI (usado solo para agrupar bien) por el Nombre, que
+        # es lo único que se muestra. "Fanero" (la fila total) se respeta tal cual.
+        dni_a_nombre = df_filtrado.drop_duplicates("DNI").set_index("DNI")["Nombre"].to_dict()
+        if desagrupar:
+            nuevo_index = pd.MultiIndex.from_tuples(
+                [(dni_a_nombre.get(dni, dni), pdv) for dni, pdv in ancho.index],
+                names=[nombre_nivel, "PDV"],
+            )
+            ancho.index = nuevo_index
+            ancho = ancho.sort_index(level=0)
+        else:
+            es_total = ancho.index == "Fanero"
+            nuevos_labels = [
+                "Fanero" if es_total[i] else dni_a_nombre.get(idx, idx)
+                for i, idx in enumerate(ancho.index)
+            ]
+            ancho.index = pd.Index(nuevos_labels, name=nombre_nivel)
+            # Reordena alfabéticamente por Nombre, dejando "Fanero" al final.
+            sin_total = ancho[ancho.index != "Fanero"].sort_index()
+            con_total = ancho[ancho.index == "Fanero"]
+            ancho = pd.concat([sin_total, con_total])
     else:
-        ancho.index = ancho.index.set_names([nombre_nivel])
+        if desagrupar:
+            ancho.index = ancho.index.set_names([nombre_nivel, "PDV"])
+        else:
+            ancho.index = ancho.index.set_names([nombre_nivel])
 
     return ancho
 
@@ -678,6 +705,15 @@ def resumen_por_producto(df_filtrado: pd.DataFrame, departamentos_sel: list,
 
 
 def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
+    """Da formato/color a la tabla y la aplana (reset_index) antes de estilar:
+    pandas Styler.apply/.map no funcionan con índices con valores repetidos
+    (por ejemplo, dos gestores distintos que se llaman igual), así que el
+    nombre del nivel (Departamento/Gestor, y PDV si aplica) pasa a ser una
+    columna normal en vez de índice — el resultado visual es el mismo."""
+    nombres_indice = list(tabla.index.names)  # ["Departamento"] o ["Gestor"] o [.., "PDV"]
+    tabla = tabla.reset_index()
+    columnas_indice = [(n, "") for n in nombres_indice]
+
     fmt = {}
     for p in orden_prod:
         fmt[(p, "Cuota")] = "{:,.0f}"
@@ -691,7 +727,7 @@ def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
         fmt[("M0 vs M-1", "M-1")] = "{:,.0f}"
         fmt[("M0 vs M-1", "%Var")] = "{:+.1%}"
 
-    styler = tabla.style.format(fmt, na_rep="-")
+    styler = tabla.style.format(fmt, na_rep="-").hide(axis="index")
     subset = [(p, "Proy %") for p in orden_prod]
     styler = _aplicar_semaforo(styler, subset)
 
@@ -705,9 +741,10 @@ def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
     # Fila "Fanero" (total general): sombreado ejecutivo distinto — fondo
     # azul marino oscuro con texto blanco, para que se note como el cierre
     # de la tabla y no se confunda con el semáforo de las demás filas.
-    if "Fanero" in tabla.index:
+    col_nivel_principal = columnas_indice[0]
+    if (tabla[col_nivel_principal] == "Fanero").any():
         def _estilo_total(fila):
-            if fila.name == "Fanero":
+            if fila[col_nivel_principal] == "Fanero":
                 return ["background-color: #1F2937; color: #FFFFFF; font-weight: 700;" for _ in fila]
             return ["" for _ in fila]
         styler = styler.apply(_estilo_total, axis=1)
@@ -719,7 +756,7 @@ def aplicar_estilo_resumen_producto(tabla: pd.DataFrame, orden_prod: list):
     styler = styler.set_table_styles(
         [
             {"selector": "table", "props": [("border-collapse", "collapse"), ("width", "100%"), ("font-size", "0.85rem")]},
-            {"selector": "th, td", "props": [("border", "1px solid #E2E4F0"), ("padding", "6px 10px"), ("text-align", "center")]},
+            {"selector": "th, td", "props": [("border", "1px solid #E2E4F0"), ("padding", "6px 10px"), ("text-align", "center"), ("white-space", "nowrap")]},
             {"selector": "th", "props": [("background-color", "#F5F6FB"), ("font-weight", "600")]},
         ],
         overwrite=True,
@@ -1406,43 +1443,51 @@ def tabla_comparativo_mensual(df_filtrado: pd.DataFrame, mes: int, anio: int, ag
     histórico archivado) y %Var. Devuelve (tabla, hay_historico) — si no hay
     histórico del mes anterior (por ejemplo, el primer mes usando la app),
     hay_historico=False y M-1/%Var quedan vacíos en vez de mostrar '0%'
-    engañoso."""
+    engañoso.
+
+    Para Gestor, se agrupa internamente por DNI (clave única, evita mezclar
+    dos gestores con el mismo nombre) y el resultado se muestra con el
+    Nombre — igual criterio que `construir_tabla_producto`, para que ambas
+    tablas se puedan unir (join) por el mismo índice."""
     anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
     df_hist = obtener_historico_mes(mes_ant, anio_ant)
 
-    df_prepago = df_filtrado[df_filtrado["Producto"] == "Prepago"].copy()
-    if agrupar_por == "Departamento":
-        nivel_col = "Departamento"
-        df_prepago["_Nivel"] = df_prepago["Departamento"]
-    else:
-        df_prepago["_Nivel"] = df_prepago["Nombre"] + " · DNI " + df_prepago["DNI"]
+    clave_col = "Departamento" if agrupar_por == "Departamento" else "DNI"
+    nombre_indice = "Departamento" if agrupar_por == "Departamento" else "Gestor"
 
-    m0 = df_prepago.groupby("_Nivel")["Avance"].sum().rename("M0")
+    df_prepago = df_filtrado[df_filtrado["Producto"] == "Prepago"].copy()
+    m0 = df_prepago.groupby(clave_col)["Avance"].sum().rename("M0")
 
     if df_hist is None:
         comparativo = m0.to_frame()
         comparativo["M-1"] = np.nan
         comparativo["%Var"] = np.nan
-        comparativo.index.name = "Departamento" if agrupar_por == "Departamento" else "Gestor"
-        return comparativo.sort_values("M0", ascending=False), False
-
-    df_prepago_hist = df_hist[df_hist["Producto"] == "Prepago"].copy()
-    if agrupar_por == "Departamento":
-        df_prepago_hist["_Nivel"] = df_prepago_hist["Departamento"]
     else:
-        df_prepago_hist["_Nivel"] = df_prepago_hist["Nombre"] + " · DNI " + df_prepago_hist["DNI"]
-    m1 = df_prepago_hist.groupby("_Nivel")["Avance"].sum().rename("M-1")
+        df_prepago_hist = df_hist[df_hist["Producto"] == "Prepago"].copy()
+        m1 = df_prepago_hist.groupby(clave_col)["Avance"].sum().rename("M-1")
 
-    comparativo = pd.concat([m0, m1], axis=1)
-    comparativo["M0"] = comparativo["M0"].fillna(0)
-    comparativo["M-1"] = comparativo["M-1"].fillna(0)
-    comparativo["%Var"] = np.where(
-        comparativo["M-1"] > 0,
-        (comparativo["M0"] - comparativo["M-1"]) / comparativo["M-1"],
-        np.where(comparativo["M0"] > 0, 1.0, 0.0),
-    )
-    comparativo.index.name = "Departamento" if agrupar_por == "Departamento" else "Gestor"
-    return comparativo.sort_values("M0", ascending=False), True
+        comparativo = pd.concat([m0, m1], axis=1)
+        comparativo["M0"] = comparativo["M0"].fillna(0)
+        comparativo["M-1"] = comparativo["M-1"].fillna(0)
+        comparativo["%Var"] = np.where(
+            comparativo["M-1"] > 0,
+            (comparativo["M0"] - comparativo["M-1"]) / comparativo["M-1"],
+            np.where(comparativo["M0"] > 0, 1.0, 0.0),
+        )
+
+    if agrupar_por == "Gestor":
+        dni_a_nombre = df_filtrado.drop_duplicates("DNI").set_index("DNI")["Nombre"].to_dict()
+        if df_hist is not None:
+            faltantes = [i for i in comparativo.index if i not in dni_a_nombre]
+            if faltantes:
+                mapa_extra = df_hist.drop_duplicates("DNI").set_index("DNI")["Nombre"].to_dict()
+                for dni_faltante in faltantes:
+                    if dni_faltante in mapa_extra:
+                        dni_a_nombre[dni_faltante] = mapa_extra[dni_faltante]
+        comparativo.index = [dni_a_nombre.get(i, i) for i in comparativo.index]
+
+    comparativo.index.name = nombre_indice
+    return comparativo.sort_values("M0", ascending=False), (df_hist is not None)
 
 
 def aplicar_estilo_comparativo(tabla: pd.DataFrame):
