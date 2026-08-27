@@ -461,29 +461,39 @@ def _nombre_producto_normalizado(texto: str) -> str | None:
 
 
 def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referencia: pd.DataFrame) -> dict[int, pd.DataFrame]:
-    """Convierte una tabla ANCHA de ventas de meses anteriores (una columna
-    por producto) al formato interno que usa la app, agrupando por mes si el
-    archivo trae más de uno. Formato esperado:
+    """Convierte una tabla ANCHA de ventas de meses anteriores (una fila por
+    PDV, una columna por producto) al formato interno que usa la app,
+    agrupando por mes si el archivo trae más de uno. Columnas esperadas:
 
-        DNI          | Mes    | Prepago | Porta Prepago | Postpago | OSS
-        11111111     | julio  | 29      | 20            | 10       | 26
+        DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | Mes | Prepago | Porta Prepago | Postpago | OSS
 
-    Devuelve {mes_numero: DataFrame_listo_para_archivar}. Nombre/Departamento/
-    Provincia/Distrito se completan buscando el DNI en `df_referencia` (los
-    datos ya publicados) — si un DNI no aparece ahí, queda con esos campos
-    vacíos, pero su venta igual se cuenta en los totales generales.
+    Obligatorias: "DNI PDV", "DNI Gestor", "Mes", y al menos un producto.
+    "Nombre PDV", "Departamento", "Provincia", "Distrito" son recomendadas
+    pero opcionales — si vienen en el archivo, se usan directamente (lo más
+    confiable, porque cada PDV ya trae su propio departamento, sin
+    depender de nada más). Si faltan, se completan buscando el DNI Gestor
+    en `df_referencia` (lo ya publicado este mes) como respaldo — pero si
+    ese gestor todavía no está publicado, quedan vacías.
+
+    Devuelve {mes_numero: DataFrame_listo_para_archivar}.
     """
-    if "DNI" not in df_ancho.columns or "Mes" not in df_ancho.columns:
-        raise ValueError("El archivo debe tener al menos las columnas 'DNI' y 'Mes'.")
+    columnas_obligatorias = {"DNI PDV", "DNI Gestor", "Mes"}
+    faltantes_obligatorias = columnas_obligatorias - set(df_ancho.columns)
+    if faltantes_obligatorias:
+        raise ValueError("Faltan columnas obligatorias: " + ", ".join(sorted(faltantes_obligatorias)))
 
     df_ancho = df_ancho.copy()
-    df_ancho["DNI"] = df_ancho["DNI"].astype(str).str.strip()
+    df_ancho["PDV"] = df_ancho["DNI PDV"].astype(str).str.strip()
+    df_ancho["DNI"] = df_ancho["DNI Gestor"].astype(str).str.strip()
     df_ancho["_MesTexto"] = df_ancho["Mes"].astype(str).str.strip().str.lower()
     df_ancho["_MesNumero"] = df_ancho["_MesTexto"].map(MESES_ES)
 
+    columnas_geo_presentes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c in df_ancho.columns]
+    columnas_excluir = {"DNI PDV", "DNI Gestor", "Mes", "PDV", "DNI", "_MesTexto", "_MesNumero"} | set(columnas_geo_presentes)
+
     mapa_col_producto = {}
     for col in df_ancho.columns:
-        if col in ("DNI", "Mes", "_MesTexto", "_MesNumero"):
+        if col in columnas_excluir:
             continue
         producto = _nombre_producto_normalizado(col)
         if producto:
@@ -499,8 +509,12 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
     if df_ancho.empty:
         raise ValueError("No se reconoció ningún mes válido en la columna 'Mes'.")
 
-    ref_cols = [c for c in ["DNI", "Nombre", "Departamento", "Provincia", "Distrito"] if c in df_referencia.columns]
-    ref = df_referencia[ref_cols].drop_duplicates(subset=["DNI"]) if "DNI" in ref_cols else pd.DataFrame(columns=["DNI"])
+    # Respaldo por DNI Gestor: para lo que NO venga en el archivo
+    # (Nombre PDV/Departamento/Provincia/Distrito), se busca en lo ya
+    # publicado este mes. "Nombre" (del gestor) se maneja aparte abajo.
+    columnas_geo_faltantes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c not in columnas_geo_presentes]
+    ref_cols = [c for c in (["DNI"] + columnas_geo_faltantes + ["Nombre"]) if c in df_referencia.columns]
+    ref = df_referencia[ref_cols].drop_duplicates(subset=["DNI"]) if "DNI" in ref_cols and len(ref_cols) > 1 else pd.DataFrame(columns=["DNI"])
 
     resultados: dict[int, pd.DataFrame] = {}
     for mes_num, grupo_mes in df_ancho.groupby("_MesNumero"):
@@ -510,15 +524,28 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
                 valor = fila[col_original]
                 if pd.isna(valor):
                     continue
-                filas.append({"DNI": fila["DNI"], "Producto": producto, "Avance": float(valor)})
+                fila_nueva = {"DNI": fila["DNI"], "PDV": fila["PDV"], "Producto": producto, "Avance": float(valor)}
+                for col_geo in columnas_geo_presentes:
+                    fila_nueva[col_geo] = fila[col_geo]
+                filas.append(fila_nueva)
         df_largo = pd.DataFrame(filas)
         if df_largo.empty:
             continue
-        df_largo = df_largo.merge(ref, on="DNI", how="left")
+        if not ref.empty:
+            df_largo = df_largo.merge(ref, on="DNI", how="left")
+
+        # El Nombre del gestor no viene en esta plantilla: si tampoco se
+        # encontró en lo ya publicado, se usa un nombre genérico legible en
+        # vez de dejarlo vacío (evita filas "sin nombre" en la tabla).
+        if "Nombre" not in df_largo.columns:
+            df_largo["Nombre"] = ""
+        df_largo["Nombre"] = df_largo["Nombre"].fillna("")
+        sin_nombre = df_largo["Nombre"] == ""
+        df_largo.loc[sin_nombre, "Nombre"] = "Gestor " + df_largo.loc[sin_nombre, "DNI"]
+
         resultados[int(mes_num)] = _normalizar_identidad(df_largo)
 
     return resultados
-
 
 def registrar_incremento_diario(df_incremento: pd.DataFrame, fecha: "pd.Timestamp") -> None:
     """Guarda, con fecha, lo que se sumó en ESTA publicación (por Gestor y
@@ -1515,12 +1542,25 @@ def panel_admin() -> None:
     st.markdown("#### 📂 Cargar ventas de un mes anterior (para M-1)")
     st.caption(
         "Sirve para tener M-1 disponible de inmediato, sin esperar a que la app archive "
-        "un mes completo por sí sola. Sube una tabla con una fila por Gestor (DNI), el "
+        "un mes completo por sí sola. Sube una tabla con una fila por PDV, el "
         "Mes en texto, y una columna por producto con el total vendido ese mes:"
     )
-    st.code("DNI | Mes | Prepago | Porta Prepago | Postpago | OSS", language=None)
+    st.code(
+        "DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | Mes | "
+        "Prepago | Porta Prepago | Postpago | OSS",
+        language=None,
+    )
     st.caption(
-        "Los nombres de columna deben coincidir exactamente con los productos "
+        "Obligatorias: **DNI PDV**, **DNI Gestor**, **Mes**, y al menos un producto. "
+        "Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas: "
+        "si las incluyes, cada PDV queda ubicado correctamente sin depender de nada más. "
+        "Si las omites, la app intenta completarlas buscando el DNI Gestor en lo que ya "
+        "esté publicado este mes — y si ese gestor todavía no está publicado, esas filas "
+        "quedan sin departamento (no se van a poder comparar por departamento, aunque sí "
+        "cuentan igual si agrupas por Gestor)."
+    )
+    st.caption(
+        "Los nombres de columna de producto deben coincidir exactamente con "
         f"({', '.join(PRODUCTOS)}). Si el archivo trae varios meses en la columna "
         "'Mes', se guardan todos por separado."
     )
@@ -1975,6 +2015,76 @@ def tabla_comparativo_mensual(df_filtrado: pd.DataFrame, mes: int, anio: int, ag
     return comparativo.sort_values("M0", ascending=False), (df_hist is not None)
 
 
+def tabla_comparativo_mensual_pdv(
+    df_filtrado: pd.DataFrame, mes: int, anio: int, agrupar_por: str,
+) -> tuple[pd.DataFrame, bool]:
+    """Versión a nivel PDV de `tabla_comparativo_mensual`: M0 vs M-1 de
+    Prepago, pero una fila por (nivel, PDV) en vez de una fila por nivel.
+
+    Se cruza por el código de PDV (columna "_PDV" con formato "código ·
+    nombre líder", igual que en `construir_tabla_producto`), NO por
+    Departamento ni por Gestor — así:
+    - Un PDV que sigue existiendo este mes muestra su M-1 real, aunque
+      haya cambiado de Gestor o Departamento entre un mes y otro.
+    - Un PDV NUEVO este mes (no existía en el histórico) queda con M-1 = 0
+      (no vacío — sí es sabido que no vendió nada el mes pasado, porque no
+      existía).
+    Los PDV que existían el mes pasado pero ya no siguen este mes
+    simplemente no aparecen aquí (esta tabla se arma sobre los PDV
+    ACTIVOS de este mes) — sí se cuentan igual en el M-1 departamental,
+    ver `tabla_comparativo_mensual`.
+    """
+    anio_ant, mes_ant = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
+    df_hist = obtener_historico_mes(mes_ant, anio_ant)
+
+    nivel_col = "Departamento" if agrupar_por == "Departamento" else "DNI"
+    nombre_nivel = "Departamento" if agrupar_por == "Departamento" else "Gestor"
+
+    def _con_clave_pdv(df_prod):
+        df_prod = df_prod.copy()
+        df_prod["_PDV"] = np.where(
+            df_prod["Nombre PDV"] != "",
+            df_prod["PDV"] + " · " + df_prod["Nombre PDV"],
+            df_prod["PDV"],
+        )
+        return df_prod
+
+    df_prepago = _con_clave_pdv(df_filtrado[df_filtrado["Producto"] == "Prepago"])
+    m0 = df_prepago.groupby([nivel_col, "_PDV"])["Avance"].sum().rename("M0")
+
+    if df_hist is None:
+        comparativo = m0.to_frame()
+        comparativo["M-1"] = np.nan
+        comparativo["%Var"] = np.nan
+        hay_historico = False
+    else:
+        df_prepago_hist = _con_clave_pdv(df_hist[df_hist["Producto"] == "Prepago"])
+        m1_por_pdv = df_prepago_hist.groupby("_PDV")["Avance"].sum()
+
+        # El M-1 se busca SOLO por código de PDV (no por nivel): así, si un
+        # PDV cambió de Gestor/Departamento entre un mes y otro, igual se
+        # encuentra su venta real del mes pasado.
+        comparativo = m0.to_frame()
+        comparativo["M-1"] = [m1_por_pdv.get(pdv, 0.0) for _, pdv in comparativo.index]
+        comparativo["%Var"] = np.where(
+            comparativo["M-1"] > 0,
+            (comparativo["M0"] - comparativo["M-1"]) / comparativo["M-1"],
+            np.where(comparativo["M0"] > 0, 1.0, 0.0),
+        )
+        hay_historico = True
+
+    if agrupar_por == "Gestor":
+        dni_a_nombre = df_filtrado.drop_duplicates("DNI").set_index("DNI")["Nombre"].to_dict()
+        comparativo.index = pd.MultiIndex.from_tuples(
+            [(dni_a_nombre.get(dni, dni), pdv) for dni, pdv in comparativo.index],
+            names=[nombre_nivel, "PDV"],
+        )
+    else:
+        comparativo.index = comparativo.index.set_names([nombre_nivel, "PDV"])
+
+    return comparativo, hay_historico
+
+
 def aplicar_estilo_comparativo(tabla: pd.DataFrame):
     def _color_var(v):
         if pd.isna(v):
@@ -2109,8 +2219,10 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     orden_prod_sel = [p for p in PRODUCTOS if p in productos_sel]
 
     # --- Columnas M0 / M-1 / %Var, agregadas AL FINAL de la tabla (después
-    # de OSS), como un grupo más "M0 vs M-1" — solo cuando no se desagrupa
-    # por PDV (a nivel PDV individual no se calcula, por ahora). ---
+    # de OSS), como un grupo más "M0 vs M-1". Sin desagrupar: una fila por
+    # Departamento/Gestor (+ "Fanero"). Desagrupado: una fila por PDV,
+    # cruzando por código de PDV (no por nivel) — un PDV nuevo este mes
+    # queda con M-1 = 0; uno que ya no sigue simplemente no aparece aquí. ---
     if not desagrupar:
         df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
         comparativo, hay_historico = tabla_comparativo_mensual(df_scope_depto, mes, anio, agrupar_por)
@@ -2121,7 +2233,15 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         comparativo.columns = pd.MultiIndex.from_tuples([("M0 vs M-1", c) for c in comparativo.columns])
         tabla = tabla.join(comparativo, how="left")
     else:
-        hay_historico = None
+        df_scope_depto = df[df["Departamento"].isin(departamentos_activos)]
+        comparativo, hay_historico = tabla_comparativo_mensual_pdv(df_scope_depto, mes, anio, agrupar_por)
+        comparativo.columns = pd.MultiIndex.from_tuples([("M0 vs M-1", c) for c in comparativo.columns])
+        tabla = tabla.join(comparativo, how="left")
+        # Un PDV nuevo este mes (sin fila en el histórico) debe verse como
+        # M-1 = 0, no vacío — solo queda vacío si NO hay histórico del todo.
+        if hay_historico:
+            tabla[("M0 vs M-1", "M-1")] = tabla[("M0 vs M-1", "M-1")].fillna(0.0)
+            tabla[("M0 vs M-1", "%Var")] = tabla[("M0 vs M-1", "%Var")].fillna(1.0)
 
     # --- Filtro por Rango de Cumplimiento: se basa en el % de PROYECCIÓN
     # (unidades) de un solo producto — Prepago por defecto (o si es el único
@@ -2166,10 +2286,11 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         altura_render = 480 if desagrupar else "content"
         renderizar_tabla_centrada(aplicar_estilo_resumen_producto(tabla, orden_prod_sel), altura_render)
     leyenda = "🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Proy %)"
-    if not desagrupar:
-        leyenda += " · M0 = venta Prepago este mes · M-1 = venta Prepago mes anterior"
+    leyenda += " · M0 = venta Prepago este mes · M-1 = venta Prepago mes anterior"
+    if desagrupar:
+        leyenda += " (por PDV: nuevo este mes = M-1 en 0)"
     st.caption(leyenda)
-    if not desagrupar and not hay_historico:
+    if not hay_historico:
         st.info(
             "M-1 y %Var todavía no tienen datos: no hay histórico del mes anterior guardado "
             "(normal en el primer mes usando la app, o puedes cargarlo manualmente en el panel admin)."
