@@ -1636,16 +1636,23 @@ def procesar_carga_horizontal_historica(
 
         fecha_dia = pd.Timestamp(year=anio, month=mes, day=numero_dia)
         registrar_incremento_diario(df_dia, fecha_dia)
-        filas_totales_mes.append(df_dia)
         dias_procesados += 1
 
-    if filas_totales_mes:
-        df_mes_completo = pd.concat(filas_totales_mes, ignore_index=True)
-        df_mes_completo = (
-            df_mes_completo.groupby(["DNI", "Nombre", "Departamento", "Provincia", "Distrito", "PDV", "Nombre PDV", "Producto"], as_index=False)
-            ["Avance"].sum()
-        )
-        _archivar_mes(df_mes_completo, mes, anio)
+    if dias_procesados > 0:
+        # El total archivado se recalcula del HISTORIAL DIARIO COMPLETO de
+        # este mes — de TODOS los productos ya cargados, no solo el de esta
+        # llamada — para no perder lo ya archivado si el mes se sube en
+        # varias partes (por día y/o por producto, en cargas separadas).
+        historial_completo = obtener_historial_diario()
+        historial_mes = historial_completo[
+            (historial_completo["Fecha"].dt.year == anio) & (historial_completo["Fecha"].dt.month == mes)
+        ]
+        if not historial_mes.empty:
+            df_mes_completo = historial_mes.groupby(
+                [c for c in ["DNI", "Nombre", "Departamento", "PDV", "Producto"] if c in historial_mes.columns],
+                as_index=False,
+            )["Avance"].sum()
+            _archivar_mes(df_mes_completo, mes, anio)
 
     return dias_procesados, dias_omitidos
 
