@@ -895,6 +895,17 @@ def vista_comisiones_gestores(df: pd.DataFrame, dias_en_mes: int, dia_corte: int
     Visitas Gestor | Postpago | Comisión. La edición de PDV Totales/Visitas
     PDV por el BO queda en un expander aparte, para que lo único que
     resalte en pantalla sea el cálculo."""
+    departamentos_disponibles = sorted(df["Departamento"].unique())
+    departamentos_sel_comision = st.multiselect(
+        "Departamento (opcional — el BO puede filtrar solo los suyos)",
+        options=departamentos_disponibles, default=[], key="depto_filtro_comision",
+    )
+    if departamentos_sel_comision:
+        df = df[df["Departamento"].isin(departamentos_sel_comision)]
+        if df.empty:
+            st.info("No hay gestores para el/los departamento(s) seleccionado(s).")
+            return
+
     conteo_pdv_actual = df.groupby("DNI")["PDV"].nunique().rename("PDV Totales (actual)")
     gestores_actuales = df[["DNI", "Nombre"]].drop_duplicates()
 
@@ -2353,7 +2364,7 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
             .mark_line(strokeWidth=3.5, point=alt.OverlayMarkDef(size=45))
             .encode(
                 x=alt.X("Fecha:T", title="Fecha", axis=alt.Axis(format="%d/%m", labelAngle=0)),
-                y=alt.Y("Avance:Q", title=f"Venta diaria ({producto_base_grafico})"),
+                y=alt.Y("Avance:Q", title=f"Venta diaria ({producto_base_grafico})", scale=alt.Scale(zero=True)),
                 color=alt.Color(f"{agrupar_por}:N", title=agrupar_por),
                 tooltip=[
                     alt.Tooltip("Fecha:T", title="Fecha", format="%d/%m/%Y"),
@@ -2362,7 +2373,6 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
                 ],
             )
             .properties(height=420)
-            .interactive()
         )
         st.altair_chart(grafico, width="stretch")
         st.caption(f"Ventas registradas por publicación, agrupadas por {agrupar_por.lower()} — no es un conteo transaccional día por día, sino lo sumado en cada carga del admin.")
