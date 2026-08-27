@@ -51,6 +51,7 @@ Listo para desplegar en Streamlit Cloud: `streamlit run app.py`
 import calendar
 import json
 import os
+import unicodedata
 from datetime import datetime
 from io import BytesIO
 
@@ -278,12 +279,38 @@ def _normalizar_texto(df: pd.DataFrame, columna: str, relleno: str = "") -> pd.D
     return df
 
 
+def _normalizar_texto_simple(texto: str) -> str:
+    """minúsculas, sin tildes — para comparar 'LORETO' con 'Loreto' sin fallar."""
+    if texto is None:
+        return ""
+    texto = str(texto).strip().lower()
+    return unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+
+
+_MAPA_DEPARTAMENTO_CANONICO = {_normalizar_texto_simple(d): d for d in DEPARTAMENTOS}
+_MAPA_PRODUCTO_CANONICO = {_normalizar_texto_simple(p): p for p in PRODUCTOS}
+
+
 def _normalizar_identidad(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica la normalización de texto a todas las columnas de identidad."""
+    """Aplica la normalización de texto a todas las columnas de identidad.
+    Además, homogeneiza Departamento y Producto a su forma canónica sin
+    importar cómo vengan escritos en el Excel (mayúsculas, tildes, espacios):
+    "LORETO", "loreto ", "Loreto" → siempre "Loreto". Sin esto, una fila con
+    "LORETO" no calzaría con la lista interna de departamentos y quedaría
+    invisible en toda la app (tabla vacía, "sin datos")."""
     df = df.copy()
     for columna in ["DNI", "Nombre", "PDV", "Nombre PDV", "Departamento", "Provincia", "Distrito"]:
         relleno = "Sin dato" if columna in ("Departamento", "Provincia", "Distrito") else ""
         df = _normalizar_texto(df, columna, relleno)
+
+    if "Departamento" in df.columns:
+        df["Departamento"] = df["Departamento"].map(
+            lambda v: _MAPA_DEPARTAMENTO_CANONICO.get(_normalizar_texto_simple(v), v)
+        )
+    if "Producto" in df.columns:
+        df["Producto"] = df["Producto"].map(
+            lambda v: _MAPA_PRODUCTO_CANONICO.get(_normalizar_texto_simple(v), v)
+        )
     return df
 
 
