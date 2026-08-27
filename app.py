@@ -593,7 +593,12 @@ def construir_tabla_producto(
     # Para Gestor, se agrupa por DNI (clave única) — el nombre se aplica
     # recién al final, solo para mostrar.
     nivel_col = "Departamento" if agrupar_por == "Departamento" else "DNI"
-    index_cols = [nivel_col] + (["_PDV"] if desagrupar else [])
+
+    # Al desagrupar por PDV, se agregan Departamento/Provincia/Distrito como
+    # columnas descriptivas justo al lado de PDV (sin duplicar Departamento
+    # si ya es el nivel principal de agrupación).
+    columnas_geo = ["Provincia", "Distrito"] if agrupar_por == "Departamento" else ["Departamento", "Provincia", "Distrito"]
+    index_cols = [nivel_col] + (["_PDV"] + columnas_geo if desagrupar else [])
 
     largo = (
         df_filtrado.groupby(index_cols + ["Producto"], as_index=False)
@@ -647,9 +652,9 @@ def construir_tabla_producto(
         # es lo único que se muestra. "Fanero" (la fila total) se respeta tal cual.
         dni_a_nombre = df_filtrado.drop_duplicates("DNI").set_index("DNI")["Nombre"].to_dict()
         if desagrupar:
+            nuevas_tuplas = [(dni_a_nombre.get(tup[0], tup[0]),) + tup[1:] for tup in ancho.index]
             nuevo_index = pd.MultiIndex.from_tuples(
-                [(dni_a_nombre.get(dni, dni), pdv) for dni, pdv in ancho.index],
-                names=[nombre_nivel, "PDV"],
+                nuevas_tuplas, names=[nombre_nivel, "PDV"] + columnas_geo,
             )
             ancho.index = nuevo_index
             ancho = ancho.sort_index(level=0)
@@ -666,7 +671,7 @@ def construir_tabla_producto(
             ancho = pd.concat([sin_total, con_total])
     else:
         if desagrupar:
-            ancho.index = ancho.index.set_names([nombre_nivel, "PDV"])
+            ancho.index = ancho.index.set_names([nombre_nivel, "PDV"] + columnas_geo)
         else:
             ancho.index = ancho.index.set_names([nombre_nivel])
 
