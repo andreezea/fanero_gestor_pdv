@@ -80,6 +80,7 @@ DATA_FILE = os.path.join(DATA_DIR, "ultima_carga.xlsx")
 DATA_META = os.path.join(DATA_DIR, "meta.json")
 LOG_EDICION = os.path.join(DATA_DIR, "ultima_edicion.json")
 HISTORICO_DIR = os.path.join(DATA_DIR, "historico")
+HISTORIAL_DIARIO_FILE = os.path.join(DATA_DIR, "historial_diario.xlsx")
 
 # Geografía de referencia: Departamento → Provincia → Distritos. Se conserva
 # tal cual de la versión anterior (misma fuente para plantilla y ejemplo).
@@ -479,6 +480,48 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
     return resultados
 
 
+def registrar_incremento_diario(df_incremento: pd.DataFrame, fecha: "pd.Timestamp") -> None:
+    """Guarda, con fecha, lo que se sumó en ESTA publicación (por Gestor y
+    Producto) — es la base para el gráfico de 'Ventas diarias' en Vista
+    Gerencial. Si ya existía un registro para esa misma Fecha+DNI+Producto
+    (se volvió a publicar el mismo día), se reemplaza en vez de duplicar."""
+    columnas = ["DNI", "Nombre", "Departamento", "Producto"]
+    columnas_presentes = [c for c in columnas if c in df_incremento.columns]
+    agregado = (
+        df_incremento.groupby(columnas_presentes, as_index=False)["Avance"].sum()
+    )
+    agregado["Fecha"] = pd.Timestamp(fecha)
+
+    if os.path.exists(HISTORIAL_DIARIO_FILE):
+        historial = pd.read_excel(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
+        historial["DNI"] = historial["DNI"].astype(str).str.strip()  # evita que Excel lo lea como número
+        agregado["DNI"] = agregado["DNI"].astype(str).str.strip()
+        claves = ["Fecha", "DNI", "Producto"]
+        historial = historial.set_index(claves)
+        nuevo = agregado.set_index(claves)
+        historial = historial.drop(index=historial.index.intersection(nuevo.index), errors="ignore")
+        historial = pd.concat([historial.reset_index(), nuevo.reset_index()], ignore_index=True)
+    else:
+        historial = agregado
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    historial.to_excel(HISTORIAL_DIARIO_FILE, index=False)
+
+
+def obtener_historial_diario() -> pd.DataFrame:
+    """Devuelve el historial completo de incrementos diarios (Fecha, DNI,
+    Nombre, Departamento, Producto, Avance), o una tabla vacía si aún no
+    hay ninguna publicación registrada."""
+    if os.path.exists(HISTORIAL_DIARIO_FILE):
+        try:
+            df = pd.read_excel(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
+            df["DNI"] = df["DNI"].astype(str).str.strip()
+            return df
+        except Exception:  # noqa: BLE001 - archivo corrupto
+            pass
+    return pd.DataFrame(columns=["Fecha", "DNI", "Nombre", "Departamento", "Producto", "Avance"])
+
+
 def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> None:
     """Publica una carga SUMANDO el Avance nuevo al acumulado ya publicado
     del mismo Mes/Año (en vez de reemplazarlo). Así el administrador puede
@@ -508,6 +551,9 @@ def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int,
     if not mismo_periodo:
         # Primera carga del mes (o primera carga de todas): no hay nada que sumar.
         publicar_datos(df_nuevo, dia_corte, mes, anio)
+        ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
+        fecha_publicacion = pd.Timestamp(year=anio, month=mes, day=min(dia_corte, ultimo_dia_mes))
+        registrar_incremento_diario(df_nuevo, fecha_publicacion)
         return
 
     claves = ["DNI", "PDV", "Producto"]
@@ -527,6 +573,12 @@ def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int,
 
     combinado = pd.concat([base, filas_nuevas]).reset_index()
     publicar_datos(combinado, dia_corte, mes, anio)
+
+    # Registra el incremento de ESTA publicación con su fecha, para el
+    # gráfico de "Ventas diarias" en Vista Gerencial.
+    ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
+    fecha_publicacion = pd.Timestamp(year=anio, month=mes, day=min(dia_corte, ultimo_dia_mes))
+    registrar_incremento_diario(df_nuevo, fecha_publicacion)
 
 
 def calcular_metricas(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> pd.DataFrame:
@@ -1935,6 +1987,40 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         file_name=nombre_archivo,
         mime="text/csv",
     )
+
+    st.markdown("---")
+    st.markdown("#### 📈 Ventas diarias")
+    st.caption(
+        "Se arma a partir de lo que se suma en cada publicación del admin. Necesita al menos 2 "
+        "publicaciones en días distintos dentro del mes para verse; con 1 sola carga no hay 'diario' que graficar."
+    )
+
+    historial = obtener_historial_diario()
+    if not historial.empty:
+        historial_mes = historial[
+            (historial["Fecha"].dt.year == anio) & (historial["Fecha"].dt.month == mes)
+            & (historial["Departamento"].isin(departamentos_activos))
+            & (historial["Producto"].isin(productos_sel))
+        ]
+    else:
+        historial_mes = historial
+
+    if historial_mes.empty:
+        st.info("Todavía no hay suficientes publicaciones registradas este mes para graficar ventas diarias.")
+    else:
+        if agrupar_por == "Departamento":
+            pivote_diario = (
+                historial_mes.groupby(["Fecha", "Departamento"])["Avance"].sum().unstack("Departamento").fillna(0)
+            )
+        else:
+            historial_mes = historial_mes.copy()
+            historial_mes["_Gestor"] = historial_mes["Nombre"]
+            pivote_diario = (
+                historial_mes.groupby(["Fecha", "_Gestor"])["Avance"].sum().unstack("_Gestor").fillna(0)
+            )
+        pivote_diario = pivote_diario.sort_index()
+        st.line_chart(pivote_diario)
+        st.caption(f"Ventas registradas por publicación, agrupadas por {agrupar_por.lower()} — no es un conteo transaccional día por día, sino lo sumado en cada carga del admin.")
 
 
 def render_acceso_admin_sidebar() -> None:
