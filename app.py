@@ -137,6 +137,25 @@ TODAS_LAS_PROVINCIAS = sorted({prov for deps in GEOGRAFIA.values() for prov in d
 # Productos analizados (el orden aquí define el orden de las columnas)
 PRODUCTOS = ["Prepago", "Porta Prepago", "Postpago", "OSS"]
 
+# ---------------------------------------------------------------------------
+# CÁLCULO DE COMISIONES DE GESTORES (pestaña dedicada)
+# ---------------------------------------------------------------------------
+# Solo estos 2 productos entran en el cálculo de comisión (ajustar aquí si
+# cambia la regla de negocio).
+PRODUCTOS_COMISION = ["Prepago", "Postpago"]
+
+# Monto en soles que se paga por cada 100% de Proy% alcanzado, por producto.
+# Ej: si Proy% Prepago = 95%, Comisión Prepago = 0.95 * 644.
+MONTO_COMISION_PRODUCTO = {"Prepago": 644.0, "Postpago": 526.0}
+
+# El Proy% nunca puede superar este tope para efectos de comisión (aunque la
+# proyección real sea mayor, se paga como máximo hasta aquí).
+TOPE_PROY_PCT_COMISION = 1.10
+
+# Archivo donde se guarda lo que el BO ingresa (PDV totales y visitas
+# promedio por gestor) — persiste entre sesiones, igual que los demás datos.
+VISITAS_FILE = os.path.join(DATA_DIR, "visitas_bo.xlsx")
+
 # Nombres de referencia para el dataset sintético
 NOMBRES_EJEMPLO = [
     "Carlos Ramírez", "María Torres", "Jorge Quispe", "Ana Flores",
@@ -557,6 +576,203 @@ def _aplicar_semaforo(styler, columnas: list):
         for col in columnas:
             styler = styler.applymap(color_semaforo, subset=[col])
     return styler
+
+
+def cargar_visitas_bo() -> pd.DataFrame:
+    """Carga lo último guardado por el BO: DNI, Nombre, PDV Totales, Visitas
+    Promedio. Si no existe el archivo todavía, devuelve una tabla vacía."""
+    if os.path.exists(VISITAS_FILE):
+        try:
+            df = pd.read_excel(VISITAS_FILE)
+            df["DNI"] = df["DNI"].astype(str).str.strip()
+            return df
+        except Exception:  # noqa: BLE001 - archivo corrupto o con formato viejo
+            pass
+    return pd.DataFrame(columns=["DNI", "Nombre", "PDV Totales", "Visitas Promedio"])
+
+
+def guardar_visitas_bo(df: pd.DataFrame) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    df.to_excel(VISITAS_FILE, index=False)
+
+
+def construir_tabla_comisiones(
+    df_filtrado: pd.DataFrame, mapa_pct_visitas: dict, dias_en_mes: int, dia_corte: int,
+) -> pd.DataFrame:
+    """Tabla de cálculo de comisiones: una fila por Gestor (+ fila "Fanero"
+    con el total), con Cuota/Avance/Proy Unidades/Proy% para Prepago y
+    Postpago, y una comisión calculada por producto:
+
+        Comisión_producto = Proy%_producto (con tope TOPE_PROY_PCT_COMISION) * MONTO_COMISION_PRODUCTO[producto]
+
+    La Proy Unidades de PREPAGO se multiplica antes por el %Visitas del
+    gestor (mapa_pct_visitas), que viene de PDV Totales / Visitas Promedio
+    ingresados por el BO.
+    """
+    df_prod = df_filtrado[df_filtrado["Producto"].isin(PRODUCTOS_COMISION)].copy()
+    factor_proyeccion = dias_en_mes / max(dia_corte, 1)
+
+    agregado = (
+        df_prod.groupby(["DNI", "Nombre", "Producto"], as_index=False)
+        .agg(Cuota=("Cuota", "sum"), Avance=("Avance", "sum"))
+    )
+    agregado["Proy Unidades"] = agregado["Avance"] * factor_proyeccion
+
+    # Ajuste por % de visitas — SOLO para Prepago.
+    es_prepago = agregado["Producto"] == "Prepago"
+    pct_visitas_fila = agregado["DNI"].map(mapa_pct_visitas).fillna(1.0)
+    agregado.loc[es_prepago, "Proy Unidades"] = agregado.loc[es_prepago, "Proy Unidades"] * pct_visitas_fila[es_prepago]
+
+    agregado["Proy %"] = np.where(agregado["Cuota"] > 0, agregado["Proy Unidades"] / agregado["Cuota"], 0.0)
+    agregado["Proy %"] = agregado["Proy %"].clip(upper=TOPE_PROY_PCT_COMISION)
+    agregado["Comision"] = agregado["Producto"].map(MONTO_COMISION_PRODUCTO) * agregado["Proy %"]
+
+    metricas = ["Cuota", "Avance", "Proy Unidades", "Proy %"]
+    pivot = agregado.pivot_table(index=["DNI", "Nombre"], columns="Producto", values=metricas, aggfunc="first")
+    pivot = pivot.swaplevel(axis=1)
+    columnas_orden = pd.MultiIndex.from_product([PRODUCTOS_COMISION, metricas])
+    pivot = pivot.reindex(columns=columnas_orden)
+
+    comision_pivot = agregado.pivot_table(index=["DNI", "Nombre"], columns="Producto", values="Comision", aggfunc="first")
+    comision_pivot = comision_pivot.reindex(columns=PRODUCTOS_COMISION).fillna(0.0)
+    comision_pivot["Total"] = comision_pivot.sum(axis=1)
+    comision_pivot.columns = pd.MultiIndex.from_tuples([("Comisión", c) for c in comision_pivot.columns])
+
+    tabla = pivot.join(comision_pivot, how="left")
+    tabla = tabla.droplevel("DNI")  # el DNI ya cumplió su función (agrupar bien); solo se muestra el Nombre
+    tabla.index.name = "Gestor"
+    tabla = tabla.sort_index()
+
+    # --- Fila "Fanero": totales reales, Proy% recalculado con tope sobre el
+    # total (no promedio de filas), Comisión recalculada sobre ese % total. ---
+    fila_total = {}
+    for p in PRODUCTOS_COMISION:
+        cuota_p = tabla[(p, "Cuota")].sum()
+        avance_p = tabla[(p, "Avance")].sum()
+        proy_p = tabla[(p, "Proy Unidades")].sum()
+        proy_pct_p = min((proy_p / cuota_p) if cuota_p > 0 else 0.0, TOPE_PROY_PCT_COMISION)
+        fila_total[(p, "Cuota")] = cuota_p
+        fila_total[(p, "Avance")] = avance_p
+        fila_total[(p, "Proy Unidades")] = proy_p
+        fila_total[(p, "Proy %")] = proy_pct_p
+        fila_total[("Comisión", p)] = proy_pct_p * MONTO_COMISION_PRODUCTO[p]
+    fila_total[("Comisión", "Total")] = sum(fila_total[("Comisión", p)] for p in PRODUCTOS_COMISION)
+
+    df_total = pd.DataFrame([fila_total], index=["Fanero"], columns=tabla.columns)
+    tabla = pd.concat([tabla, df_total])
+    tabla.index.name = "Gestor"  # pd.concat no siempre conserva el nombre del índice
+
+    return tabla
+
+
+def aplicar_estilo_comisiones(tabla: pd.DataFrame):
+    """Formato + estilo para la tabla de comisiones (reset_index primero,
+    igual que aplicar_estilo_resumen_producto, por si hay gestores homónimos)."""
+    nombre_indice = tabla.index.name or "Gestor"
+    tabla = tabla.reset_index()
+    col_gestor = (nombre_indice, "") if isinstance(tabla.columns, pd.MultiIndex) else nombre_indice
+    if col_gestor not in tabla.columns:
+        # reset_index() puede nombrar la columna "index" si el índice no tenía nombre
+        col_gestor = tabla.columns[0]
+
+    fmt = {}
+    for p in PRODUCTOS_COMISION:
+        fmt[(p, "Cuota")] = "{:,.0f}"
+        fmt[(p, "Avance")] = "{:,.0f}"
+        fmt[(p, "Proy Unidades")] = "{:,.0f}"
+        fmt[(p, "Proy %")] = "{:.1%}"
+    fmt[("Comisión", "Prepago")] = "S/ {:,.0f}"
+    fmt[("Comisión", "Postpago")] = "S/ {:,.0f}"
+    fmt[("Comisión", "Total")] = "S/ {:,.0f}"
+
+    styler = tabla.style.format(fmt, na_rep="-").hide(axis="index")
+    subset = [(p, "Proy %") for p in PRODUCTOS_COMISION]
+    styler = _aplicar_semaforo(styler, subset)
+
+    if (tabla[col_gestor] == "Fanero").any():
+        def _estilo_total(fila):
+            if fila[col_gestor] == "Fanero":
+                return ["background-color: #1F2937; color: #FFFFFF; font-weight: 700;" for _ in fila]
+            return ["" for _ in fila]
+        styler = styler.apply(_estilo_total, axis=1)
+
+    styler = styler.set_table_styles(
+        [
+            {"selector": "table", "props": [("border-collapse", "collapse"), ("width", "100%"), ("font-size", "0.85rem")]},
+            {"selector": "th, td", "props": [("border", "1px solid #E2E4F0"), ("padding", "6px 10px"), ("text-align", "center"), ("white-space", "nowrap")]},
+            {"selector": "th", "props": [("background-color", "#F5F6FB"), ("font-weight", "600")]},
+        ],
+        overwrite=True,
+    )
+    styler = styler.set_properties(**{"text-align": "center"})
+    return styler
+
+
+def vista_comisiones_gestores(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> None:
+    """Pestaña 'Cálculo Comisiones Gestores': el BO ingresa PDV totales y
+    visitas promedio por gestor, y la app calcula la comisión de Prepago +
+    Postpago (con tope de 110% y ajuste de Prepago por % de visitas)."""
+    conteo_pdv_actual = df.groupby("DNI")["PDV"].nunique().rename("PDV Totales (actual)")
+    gestores_actuales = df[["DNI", "Nombre"]].drop_duplicates()
+
+    visitas_guardadas = cargar_visitas_bo()
+    tabla_visitas = gestores_actuales.merge(
+        visitas_guardadas[["DNI", "PDV Totales", "Visitas Promedio"]], on="DNI", how="left"
+    )
+    tabla_visitas = tabla_visitas.merge(conteo_pdv_actual, on="DNI", how="left")
+    tabla_visitas["PDV Totales"] = tabla_visitas["PDV Totales"].fillna(tabla_visitas["PDV Totales (actual)"]).fillna(0)
+    tabla_visitas["Visitas Promedio"] = tabla_visitas["Visitas Promedio"].fillna(0)
+    tabla_visitas = tabla_visitas.drop(columns=["PDV Totales (actual)"]).sort_values("Nombre")
+
+    st.markdown("#### 📋 Datos de visitas por Gestor (Back Office)")
+    st.caption(
+        "El BO ingresa la cantidad de PDV que tiene cada gestor y el promedio de visitas realizadas. "
+        "El sistema calcula %Visitas = Visitas Promedio / PDV Totales, y ese % ajusta la proyección de Prepago."
+    )
+    editado = st.data_editor(
+        tabla_visitas[["DNI", "Nombre", "PDV Totales", "Visitas Promedio"]],
+        disabled=["DNI", "Nombre"],
+        hide_index=True,
+        width="stretch",
+        key="editor_visitas_bo",
+    )
+    if st.button("💾 Guardar datos de visitas"):
+        guardar_visitas_bo(editado[["DNI", "Nombre", "PDV Totales", "Visitas Promedio"]])
+        st.success("Datos de visitas guardados.")
+        st.rerun()
+
+    mapa_pct_visitas = {
+        row["DNI"]: (row["Visitas Promedio"] / row["PDV Totales"]) if row["PDV Totales"] > 0 else 1.0
+        for _, row in editado.iterrows()
+    }
+
+    st.markdown("---")
+    st.markdown("#### 💰 Cálculo de comisiones (Prepago + Postpago)")
+    st.caption(
+        f"Comisión = Proy% (tope {TOPE_PROY_PCT_COMISION:.0%}) × Monto del producto "
+        f"(Prepago S/ {MONTO_COMISION_PRODUCTO['Prepago']:,.0f} · Postpago S/ {MONTO_COMISION_PRODUCTO['Postpago']:,.0f}). "
+        "La Proy Unidades de Prepago ya viene ajustada por el %Visitas de cada gestor."
+    )
+
+    tabla = construir_tabla_comisiones(df, mapa_pct_visitas, dias_en_mes, dia_corte)
+
+    n_gestores = df["DNI"].nunique()
+    comision_total = tabla.loc["Fanero", ("Comisión", "Total")]
+    col1, col2 = st.columns(2)
+    col1.metric("Gestores", f"{n_gestores:,}")
+    col2.metric("💰 Comisión total estimada", f"S/ {comision_total:,.0f}")
+
+    renderizar_tabla_centrada(aplicar_estilo_comisiones(tabla), "content")
+    st.caption("🟥 <80% · 🟨 80%–99% · 🟩 ≥100% (aplica a Proy %, con tope de 110%)")
+
+    tabla_csv = tabla.copy()
+    tabla_csv.columns = [f"{p} - {m}" for p, m in tabla_csv.columns]
+    st.download_button(
+        "⬇️ Descargar cálculo de comisiones (CSV)",
+        data=tabla_csv.reset_index().to_csv(index=False).encode("utf-8"),
+        file_name="calculo_comisiones_gestores.csv",
+        mime="text/csv",
+    )
 
 
 def construir_tabla_producto(
@@ -1728,13 +1944,13 @@ def main():
 
     df = calcular_metricas(df_raw, dias_en_mes, dia_corte)
 
-    tabs = st.tabs(["👤 Mi Cartera (Gestor)", "🏢 Vista Gerencial", "✏️ Editar Avances"])
+    tabs = st.tabs(["💰 Cálculo Comisiones Gestores", "👤 Mi Cartera (Gestor)", "✏️ Editar Avances"])
 
     with tabs[0]:
-        vista_gestor(df, dias_en_mes, dia_corte, dias_restantes)
+        vista_comisiones_gestores(df, dias_en_mes, dia_corte)
 
     with tabs[1]:
-        vista_gerencial(df, dias_en_mes, dia_corte, mes, anio)
+        vista_gestor(df, dias_en_mes, dia_corte, dias_restantes)
 
     with tabs[2]:
         st.subheader("Editar Avances")
