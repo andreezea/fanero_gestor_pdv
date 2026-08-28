@@ -765,6 +765,38 @@ def publicar_datos_incremental(
         registrar_incremento_diario(df_nuevo, fecha_publicacion)
 
 
+def publicar_datos_reemplazo_total_con_alcance(
+    df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int, departamentos_alcance: list | None = None,
+) -> None:
+    """Como marcar la casilla '⚠️ REEMPLAZAR' de la carga principal, pero con
+    alcance opcional: si `departamentos_alcance` viene con uno o más
+    departamentos, SOLO se reemplazan esos departamentos (se conserva todo
+    lo publicado de los demás departamentos, tal cual estaba). Si
+    `departamentos_alcance` es None o está vacío, reemplaza TODO (igual que
+    antes)."""
+    if not departamentos_alcance:
+        publicar_datos(df_nuevo, dia_corte, mes, anio)
+        return
+
+    df_nuevo = _normalizar_identidad(df_nuevo)
+    if os.path.exists(DATA_FILE):
+        df_actual, _, mes_actual, anio_actual = obtener_datos_publicados()
+        mismo_periodo = (int(mes_actual) == int(mes)) and (int(anio_actual) == int(anio))
+    else:
+        mismo_periodo = False
+
+    if not mismo_periodo:
+        # No hay nada del mismo mes que conservar — se publica tal cual.
+        publicar_datos(df_nuevo, dia_corte, mes, anio)
+        return
+
+    df_actual = _normalizar_identidad(df_actual)
+    filas_conservadas = df_actual[~df_actual["Departamento"].isin(departamentos_alcance)]
+    filas_nuevas = df_nuevo[df_nuevo["Departamento"].isin(departamentos_alcance)]
+    combinado = pd.concat([filas_conservadas, filas_nuevas], ignore_index=True)
+    publicar_datos(combinado, dia_corte, mes, anio)
+
+
 def publicar_datos_reemplazo_parcial(
     df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int, registrar_historial: bool = True,
 ) -> None:
@@ -1819,286 +1851,378 @@ def panel_admin() -> None:
         file_name="plantilla_carga_gestores.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    st.info(
-        "📌 **Cómo funciona la carga:** el Avance que subas se **SUMA automáticamente** "
-        "al acumulado que ya está publicado este mes (no lo reemplaza). Sube solo lo "
-        "vendido en el día o periodo más reciente — la app se encarga de acumularlo. "
-        "Cuota se actualiza con el valor del archivo (no se suma, es la meta del mes). "
-        "Al cambiar de Mes/Año, la app empieza el acumulado de cero automáticamente."
-    )
-    st.caption(
-        "Elimina las filas de ejemplo antes de subir tu archivo real. Cada PDV "
-        "debe tener una fila por producto (Prepago, Porta Prepago, Postpago, OSS). "
-        "PDV = DNI del líder de ese punto de venta; Nombre PDV = su nombre. "
-        "DNI y Nombre (columnas iniciales) identifican al Gestor dueño del PDV."
-    )
 
-    with st.expander("Columnas del Excel"):
-        st.write("Todas obligatorias:", sorted(COLUMNAS_REQUERIDAS))
-
-    ahora = datetime.now()
-    col_mes, col_anio = st.columns(2)
-    with col_mes:
-        mes_sel = st.number_input("Mes de la cuota", min_value=1, max_value=12, value=ahora.month)
-    with col_anio:
-        anio_sel = st.number_input("Año", min_value=2020, max_value=2100, value=ahora.year, step=1)
-
-    dias_en_mes_sel = calendar.monthrange(int(anio_sel), int(mes_sel))[1]
-    dia_corte_defecto = min(max(ahora.day - 1, 1), dias_en_mes_sel)
-    dia_corte_sel = st.number_input(
-        "Día de corte (hasta qué día del mes llega el Avance de esta carga)",
-        min_value=1, max_value=dias_en_mes_sel, value=dia_corte_defecto,
-    )
-
-    archivo = st.file_uploader("Cargar archivo Excel (.xlsx)", type=["xlsx"])
-
-    forzar_reemplazo = st.checkbox(
-        "⚠️ Esta carga REEMPLAZA todo lo publicado, en vez de sumarlo "
-        "(úsalo solo para corregir un error de carga, o si tu archivo trae el acumulado total del mes)."
-    )
-
-    if archivo is not None:
-        df_preview = cargar_datos_excel(archivo)
-        if df_preview is not None and not forzar_reemplazo:
-            avance_nuevo = df_preview["Avance"].sum()
-            avance_actual = 0.0
-            if os.path.exists(DATA_FILE):
-                df_actual_preview, _, mes_actual_preview, anio_actual_preview = obtener_datos_publicados()
-                if int(mes_actual_preview) == int(mes_sel) and int(anio_actual_preview) == int(anio_sel):
-                    avance_actual = df_actual_preview["Avance"].sum()
-            st.info(
-                f"📊 **Vista previa:** este archivo suma **{avance_nuevo:,.0f}** unidades de Avance. "
-                f"En modo SUMAR (el de arriba, sin marcar), el acumulado del mes pasaría de "
-                f"**{avance_actual:,.0f}** a **{avance_actual + avance_nuevo:,.0f}**.\n\n"
-                "⚠️ Si tu archivo trae el **acumulado total hasta hoy** (no solo lo vendido en el día/periodo "
-                "más reciente), esto va a duplicar tus ventas — en ese caso, marca la casilla de REEMPLAZAR "
-                "arriba, o pon Avance = 0 si solo quieres actualizar la Cuota."
-            )
-
-    if archivo is not None and st.button("Publicar datos"):
-        df_validado = cargar_datos_excel(archivo)
-        if df_validado is not None:
-            if forzar_reemplazo:
-                publicar_datos(df_validado, int(dia_corte_sel), int(mes_sel), int(anio_sel))
-                st.success("Datos publicados: se REEMPLAZÓ todo lo anterior con este archivo.")
-            else:
-                publicar_datos_incremental(df_validado, int(dia_corte_sel), int(mes_sel), int(anio_sel))
-                st.success(
-                    "Datos publicados: el Avance se sumó al acumulado del mes. "
-                    "Todos los usuarios verán la actualización al recargar."
-                )
-
+    departamentos_disponibles_admin = sorted(GEOGRAFIA.keys())
     if os.path.exists(DATA_FILE):
-        ultima_actualizacion = datetime.fromtimestamp(os.path.getmtime(DATA_FILE))
-        st.caption(f"Última publicación: {ultima_actualizacion:%d/%m/%Y %H:%M}")
-
-    st.markdown("---")
-    st.markdown("#### 📂 Cargar ventas de un mes anterior (para M-1)")
-    st.caption(
-        "Sirve para tener M-1 disponible de inmediato, sin esperar a que la app archive "
-        "un mes completo por sí sola. Sube una tabla con una fila por PDV, el "
-        "Mes en texto, y una columna por producto con el total vendido ese mes:"
-    )
-    st.code(
-        "DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | Mes | "
-        "Prepago | Porta Prepago | Postpago | OSS",
-        language=None,
-    )
-    st.caption(
-        "Obligatorias: **DNI PDV**, **DNI Gestor**, **Mes**, y al menos un producto. "
-        "Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas: "
-        "si las incluyes, cada PDV queda ubicado correctamente sin depender de nada más. "
-        "Si las omites, la app intenta completarlas buscando el DNI Gestor en lo que ya "
-        "esté publicado este mes — y si ese gestor todavía no está publicado, esas filas "
-        "quedan sin departamento (no se van a poder comparar por departamento, aunque sí "
-        "cuentan igual si agrupas por Gestor)."
-    )
-    st.caption(
-        "Los nombres de columna de producto deben coincidir exactamente con "
-        f"({', '.join(PRODUCTOS)}). Si el archivo trae varios meses en la columna "
-        "'Mes', se guardan todos por separado."
-    )
-
-    anio_historico = st.number_input(
-        "Año de este archivo histórico", min_value=2020, max_value=2100,
-        value=datetime.now().year, step=1, key="anio_historico_carga",
-    )
-    archivo_historico = st.file_uploader(
-        "Excel de ventas de mes(es) anterior(es) (formato ancho)", type=["xlsx"], key="uploader_historico_ancho",
-    )
-
-    if archivo_historico is not None and st.button("Guardar como histórico"):
         try:
-            df_ancho = leer_excel_seguro(archivo_historico)
-        except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
-            st.error(f"No se pudo leer el archivo: {exc}")
-            df_ancho = None
-
-        if df_ancho is not None:
-            df_referencia, _, _, _ = obtener_datos_publicados()
-            try:
-                resultados = procesar_carga_historico_ancho(df_ancho, int(anio_historico), df_referencia)
-            except ValueError as exc:
-                st.error(str(exc))
-                resultados = {}
-
-            if resultados:
-                for mes_num, df_mes in resultados.items():
-                    _archivar_mes(df_mes, mes_num, int(anio_historico))
-                meses_nombres = {v: k for k, v in MESES_ES.items() if k not in ("setiembre",)}
-                meses_guardados = ", ".join(meses_nombres.get(m, str(m)) for m in sorted(resultados.keys()))
-                st.success(f"Histórico guardado para: {meses_guardados} de {int(anio_historico)}.")
-
-    st.markdown("---")
-    st.markdown("#### 📅 Cargar ventas diarias (formato horizontal)")
-    st.caption(
-        "Alternativa a subir un archivo por día: una sola tabla con una columna por cada día del "
-        "mes (nombradas 1, 2, 3... 31), con la venta de ESE día en cada celda (no acumulada). "
-        "La app publica automáticamente día por día, en orden, igual que si hubieras subido un "
-        "archivo distinto cada día."
-    )
-    st.code("DNI | Nombre | Departamento | Provincia | Distrito | PDV | Nombre PDV | 1 | 2 | 3 | ... | 31", language=None)
-    st.caption("La Cuota no va en este archivo: se conserva la que ya esté publicada para cada PDV+Producto.")
-
-    col_prod_h, col_mes_h, col_anio_h = st.columns(3)
-    with col_prod_h:
-        producto_horizontal = st.selectbox("Producto de este archivo", PRODUCTOS, key="producto_horizontal")
-    with col_mes_h:
-        mes_horizontal = st.number_input("Mes", min_value=1, max_value=12, value=datetime.now().month, key="mes_horizontal")
-    with col_anio_h:
-        anio_horizontal = st.number_input(
-            "Año", min_value=2020, max_value=2100, value=datetime.now().year, step=1, key="anio_horizontal",
-        )
-
-    archivo_horizontal = st.file_uploader(
-        "Excel de ventas diarias (formato horizontal)", type=["xlsx"], key="uploader_horizontal_diario",
-    )
-    reemplazar_horizontal = st.checkbox(
-        "⚠️ Reemplazar en vez de sumar (usa esto si vas a volver a subir el MISMO rango de días "
-        "que ya habías cargado antes, para no duplicar)",
-        key="reemplazar_horizontal",
-    )
-
-    if archivo_horizontal is not None and st.button("Procesar y publicar ventas diarias"):
-        try:
-            df_horizontal = leer_excel_seguro(archivo_horizontal)
-        except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
-            st.error(f"No se pudo leer el archivo: {exc}")
-            df_horizontal = None
-
-        if df_horizontal is not None:
-            try:
-                dias_ok, dias_omitidos = procesar_carga_horizontal_diaria(
-                    df_horizontal, producto_horizontal, int(mes_horizontal), int(anio_horizontal),
-                    reemplazar=reemplazar_horizontal,
-                )
-            except ValueError as exc:
-                st.error(str(exc))
-                dias_ok, dias_omitidos = 0, []
-
-            if dias_ok > 0:
-                verbo = "reemplazaron" if reemplazar_horizontal else "sumaron"
-                mensaje = f"Se {verbo} {dias_ok} día(s) de {producto_horizontal} para {int(mes_horizontal)}/{int(anio_horizontal)}."
-                if dias_omitidos:
-                    mensaje += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos))}."
-                st.success(mensaje)
-
-    st.markdown("---")
-    st.markdown("#### 📅➕ Cargar ventas diarias de un MES ANTERIOR (histórico)")
-    st.caption(
-        "Para poder comparar M0 vs M-1 'mismo día contra mismo día' en Vista Gerencial, en vez del "
-        "total del mes completo. Esta carga NO toca los datos del mes en curso — solo alimenta el "
-        "histórico. Acepta CUALQUIERA de estos 2 formatos de columnas (uses el que ya tengas armado):"
-    )
-    st.code(
-        "DNI | Nombre | Departamento | Provincia | Distrito | PDV | Nombre PDV | 1 | 2 | 3 | ... | 31\n"
-        "DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | 1 | 2 | 3 | ... | 31",
-        language=None,
-    )
-    st.caption(
-        "Obligatorias: el identificador de PDV (**PDV** o **DNI PDV**) y el de Gestor "
-        "(**DNI** o **DNI Gestor**), y al menos una columna de día. "
-        "Nombre/Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas — si "
-        "las omites, se completan buscando el DNI del gestor en lo ya publicado este mes (y si "
-        "tampoco se encuentra ahí, quedan vacías)."
-    )
-
-    col_prod_hh, col_mes_hh, col_anio_hh = st.columns(3)
-    with col_prod_hh:
-        producto_hist_horizontal = st.selectbox("Producto de este archivo", PRODUCTOS, key="producto_hist_horizontal")
-    with col_mes_hh:
-        mes_hist_horizontal = st.number_input(
-            "Mes (el mes anterior, no el actual)", min_value=1, max_value=12, value=datetime.now().month,
-            key="mes_hist_horizontal",
-        )
-    with col_anio_hh:
-        anio_hist_horizontal = st.number_input(
-            "Año", min_value=2020, max_value=2100, value=datetime.now().year, step=1, key="anio_hist_horizontal",
-        )
-
-    archivo_hist_horizontal = st.file_uploader(
-        "Excel de ventas diarias históricas (formato horizontal)", type=["xlsx"], key="uploader_hist_horizontal",
-    )
-
-    if archivo_hist_horizontal is not None and st.button("Procesar histórico diario"):
-        df_referencia_hist, _, mes_actual_check, anio_actual_check = obtener_datos_publicados()
-        if int(mes_hist_horizontal) == int(mes_actual_check) and int(anio_hist_horizontal) == int(anio_actual_check):
-            st.error(
-                f"⚠️ Seleccionaste {int(mes_hist_horizontal)}/{int(anio_hist_horizontal)}, pero ese es el MES "
-                "ACTUAL (el que ya está publicado en Vista Gerencial), no un mes anterior. Si subes aquí el mes "
-                "actual, la comparación M0 vs M-1 se distorsiona. Cambia el Mes/Año arriba al mes que sí quieres "
-                "guardar como histórico (ej. si agosto es el actual, aquí va julio)."
+            df_pub_actual_admin, _, _, _ = obtener_datos_publicados()
+            departamentos_disponibles_admin = sorted(
+                set(departamentos_disponibles_admin) | set(df_pub_actual_admin["Departamento"].unique())
             )
-        else:
+        except Exception:  # noqa: BLE001
+            pass
+
+    with st.expander("📤 Cargar ventas del mes actual (plantilla normal)", expanded=True):
+        st.info(
+            "📌 **Cómo funciona la carga:** el Avance que subas se **SUMA automáticamente** "
+            "al acumulado que ya está publicado este mes (no lo reemplaza). Sube solo lo "
+            "vendido en el día o periodo más reciente — la app se encarga de acumularlo. "
+            "Cuota se actualiza con el valor del archivo (no se suma, es la meta del mes). "
+            "Al cambiar de Mes/Año, la app empieza el acumulado de cero automáticamente."
+        )
+        st.caption(
+            "Elimina las filas de ejemplo antes de subir tu archivo real. Cada PDV "
+            "debe tener una fila por producto (Prepago, Porta Prepago, Postpago, OSS). "
+            "PDV = DNI del líder de ese punto de venta; Nombre PDV = su nombre. "
+            "DNI y Nombre (columnas iniciales) identifican al Gestor dueño del PDV."
+        )
+
+        with st.expander("Columnas del Excel"):
+            st.write("Todas obligatorias:", sorted(COLUMNAS_REQUERIDAS))
+
+        ahora = datetime.now()
+        col_mes, col_anio = st.columns(2)
+        with col_mes:
+            mes_sel = st.number_input("Mes de la cuota", min_value=1, max_value=12, value=ahora.month)
+        with col_anio:
+            anio_sel = st.number_input("Año", min_value=2020, max_value=2100, value=ahora.year, step=1)
+
+        dias_en_mes_sel = calendar.monthrange(int(anio_sel), int(mes_sel))[1]
+        dia_corte_defecto = min(max(ahora.day - 1, 1), dias_en_mes_sel)
+        dia_corte_sel = st.number_input(
+            "Día de corte (hasta qué día del mes llega el Avance de esta carga)",
+            min_value=1, max_value=dias_en_mes_sel, value=dia_corte_defecto,
+        )
+
+        archivo = st.file_uploader("Cargar archivo Excel (.xlsx)", type=["xlsx"])
+
+        forzar_reemplazo = st.checkbox(
+            "⚠️ Esta carga REEMPLAZA todo lo publicado, en vez de sumarlo "
+            "(úsalo solo para corregir un error de carga, o si tu archivo trae el acumulado total del mes)."
+        )
+        departamentos_alcance_normal = st.multiselect(
+            "Aplicar esta carga solo a estos departamentos (opcional — vacío = todos los que traiga el archivo)",
+            options=departamentos_disponibles_admin, default=[], key="depto_alcance_normal",
+        )
+        if forzar_reemplazo and departamentos_alcance_normal:
+            st.caption(
+                f"⚠️ Con REEMPLAZAR activo, solo se van a reemplazar {', '.join(departamentos_alcance_normal)} "
+                "— el resto de departamentos que ya estén publicados se conservan tal cual."
+            )
+
+        if archivo is not None:
+            df_preview = cargar_datos_excel(archivo)
+            if df_preview is not None and not forzar_reemplazo:
+                avance_nuevo = df_preview["Avance"].sum()
+                avance_actual = 0.0
+                if os.path.exists(DATA_FILE):
+                    df_actual_preview, _, mes_actual_preview, anio_actual_preview = obtener_datos_publicados()
+                    if int(mes_actual_preview) == int(mes_sel) and int(anio_actual_preview) == int(anio_sel):
+                        avance_actual = df_actual_preview["Avance"].sum()
+                st.info(
+                    f"📊 **Vista previa:** este archivo suma **{avance_nuevo:,.0f}** unidades de Avance. "
+                    f"En modo SUMAR (el de arriba, sin marcar), el acumulado del mes pasaría de "
+                    f"**{avance_actual:,.0f}** a **{avance_actual + avance_nuevo:,.0f}**.\n\n"
+                    "⚠️ Si tu archivo trae el **acumulado total hasta hoy** (no solo lo vendido en el día/periodo "
+                    "más reciente), esto va a duplicar tus ventas — en ese caso, marca la casilla de REEMPLAZAR "
+                    "arriba, o pon Avance = 0 si solo quieres actualizar la Cuota."
+                )
+
+        if archivo is not None and st.button("Publicar datos"):
+            df_validado = cargar_datos_excel(archivo)
+            if df_validado is not None:
+                if forzar_reemplazo:
+                    publicar_datos_reemplazo_total_con_alcance(
+                        df_validado, int(dia_corte_sel), int(mes_sel), int(anio_sel), departamentos_alcance_normal,
+                    )
+                    if departamentos_alcance_normal:
+                        st.success(f"Datos publicados: se REEMPLAZARON solo {', '.join(departamentos_alcance_normal)}.")
+                    else:
+                        st.success("Datos publicados: se REEMPLAZÓ todo lo anterior con este archivo.")
+                else:
+                    df_a_publicar = (
+                        df_validado[df_validado["Departamento"].isin(departamentos_alcance_normal)]
+                        if departamentos_alcance_normal else df_validado
+                    )
+                    publicar_datos_incremental(df_a_publicar, int(dia_corte_sel), int(mes_sel), int(anio_sel))
+                    st.success(
+                        "Datos publicados: el Avance se sumó al acumulado del mes. "
+                        "Todos los usuarios verán la actualización al recargar."
+                    )
+
+        if os.path.exists(DATA_FILE):
+            ultima_actualizacion = datetime.fromtimestamp(os.path.getmtime(DATA_FILE))
+            st.caption(f"Última publicación: {ultima_actualizacion:%d/%m/%Y %H:%M}")
+
+    with st.expander("📂 Cargar ventas de un mes anterior (para M-1)"):
+        st.caption(
+            "Sirve para tener M-1 disponible de inmediato, sin esperar a que la app archive "
+            "un mes completo por sí sola. Sube una tabla con una fila por PDV, el "
+            "Mes en texto, y una columna por producto con el total vendido ese mes:"
+        )
+        st.code(
+            "DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | Mes | "
+            "Prepago | Porta Prepago | Postpago | OSS",
+            language=None,
+        )
+        st.caption(
+            "Obligatorias: **DNI PDV**, **DNI Gestor**, **Mes**, y al menos un producto. "
+            "Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas: "
+            "si las incluyes, cada PDV queda ubicado correctamente sin depender de nada más. "
+            "Si las omites, la app intenta completarlas buscando el DNI Gestor en lo que ya "
+            "esté publicado este mes — y si ese gestor todavía no está publicado, esas filas "
+            "quedan sin departamento (no se van a poder comparar por departamento, aunque sí "
+            "cuentan igual si agrupas por Gestor)."
+        )
+        st.caption(
+            "Los nombres de columna de producto deben coincidir exactamente con "
+            f"({', '.join(PRODUCTOS)}). Si el archivo trae varios meses en la columna "
+            "'Mes', se guardan todos por separado."
+        )
+
+        anio_historico = st.number_input(
+            "Año de este archivo histórico", min_value=2020, max_value=2100,
+            value=datetime.now().year, step=1, key="anio_historico_carga",
+        )
+        archivo_historico = st.file_uploader(
+            "Excel de ventas de mes(es) anterior(es) (formato ancho)", type=["xlsx"], key="uploader_historico_ancho",
+        )
+        departamentos_alcance_m1 = st.multiselect(
+            "Aplicar solo a estos departamentos (opcional — vacío = todos los que traiga el archivo)",
+            options=departamentos_disponibles_admin, default=[], key="depto_alcance_m1",
+        )
+
+        if archivo_historico is not None and st.button("Guardar como histórico"):
             try:
-                df_hist_horizontal = leer_excel_seguro(archivo_hist_horizontal)
+                df_ancho = leer_excel_seguro(archivo_historico)
             except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
                 st.error(f"No se pudo leer el archivo: {exc}")
-                df_hist_horizontal = None
+                df_ancho = None
 
-            if df_hist_horizontal is not None:
+            if df_ancho is not None:
+                if departamentos_alcance_m1 and "Departamento" in df_ancho.columns:
+                    df_ancho = df_ancho[df_ancho["Departamento"].isin(departamentos_alcance_m1)]
+                df_referencia, _, _, _ = obtener_datos_publicados()
                 try:
-                    dias_ok_h, dias_omitidos_h = procesar_carga_horizontal_historica(
-                        df_hist_horizontal, producto_hist_horizontal,
-                        int(mes_hist_horizontal), int(anio_hist_horizontal), df_referencia_hist,
+                    resultados = procesar_carga_historico_ancho(df_ancho, int(anio_historico), df_referencia)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    resultados = {}
+
+                if resultados:
+                    for mes_num, df_mes in resultados.items():
+                        _archivar_mes(df_mes, mes_num, int(anio_historico))
+                    meses_nombres = {v: k for k, v in MESES_ES.items() if k not in ("setiembre",)}
+                    meses_guardados = ", ".join(meses_nombres.get(m, str(m)) for m in sorted(resultados.keys()))
+                    st.success(f"Histórico guardado para: {meses_guardados} de {int(anio_historico)}.")
+
+    with st.expander("📅 Cargar ventas diarias (formato horizontal)"):
+        st.caption(
+            "Alternativa a subir un archivo por día: una sola tabla con una columna por cada día del "
+            "mes (nombradas 1, 2, 3... 31), con la venta de ESE día en cada celda (no acumulada). "
+            "La app publica automáticamente día por día, en orden, igual que si hubieras subido un "
+            "archivo distinto cada día."
+        )
+        st.code("DNI | Nombre | Departamento | Provincia | Distrito | PDV | Nombre PDV | 1 | 2 | 3 | ... | 31", language=None)
+        st.caption("La Cuota no va en este archivo: se conserva la que ya esté publicada para cada PDV+Producto.")
+
+        col_prod_h, col_mes_h, col_anio_h = st.columns(3)
+        with col_prod_h:
+            producto_horizontal = st.selectbox("Producto de este archivo", PRODUCTOS, key="producto_horizontal")
+        with col_mes_h:
+            mes_horizontal = st.number_input("Mes", min_value=1, max_value=12, value=datetime.now().month, key="mes_horizontal")
+        with col_anio_h:
+            anio_horizontal = st.number_input(
+                "Año", min_value=2020, max_value=2100, value=datetime.now().year, step=1, key="anio_horizontal",
+            )
+
+        archivo_horizontal = st.file_uploader(
+            "Excel de ventas diarias (formato horizontal)", type=["xlsx"], key="uploader_horizontal_diario",
+        )
+        reemplazar_horizontal = st.checkbox(
+            "⚠️ Reemplazar en vez de sumar (usa esto si vas a volver a subir el MISMO rango de días "
+            "que ya habías cargado antes, para no duplicar)",
+            key="reemplazar_horizontal",
+        )
+        departamentos_alcance_horizontal = st.multiselect(
+            "Aplicar solo a estos departamentos (opcional — vacío = todos los que traiga el archivo)",
+            options=departamentos_disponibles_admin, default=[], key="depto_alcance_horizontal",
+        )
+
+        if archivo_horizontal is not None and st.button("Procesar y publicar ventas diarias"):
+            try:
+                df_horizontal = leer_excel_seguro(archivo_horizontal)
+            except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
+                st.error(f"No se pudo leer el archivo: {exc}")
+                df_horizontal = None
+
+            if df_horizontal is not None:
+                if departamentos_alcance_horizontal:
+                    df_horizontal = df_horizontal[df_horizontal["Departamento"].isin(departamentos_alcance_horizontal)]
+                try:
+                    dias_ok, dias_omitidos = procesar_carga_horizontal_diaria(
+                        df_horizontal, producto_horizontal, int(mes_horizontal), int(anio_horizontal),
+                        reemplazar=reemplazar_horizontal,
                     )
                 except ValueError as exc:
                     st.error(str(exc))
-                    dias_ok_h, dias_omitidos_h = 0, []
+                    dias_ok, dias_omitidos = 0, []
 
-                if dias_ok_h > 0:
-                    mensaje_h = (
-                        f"Se guardó el histórico diario de {producto_hist_horizontal} para "
-                        f"{int(mes_hist_horizontal)}/{int(anio_hist_horizontal)} ({dias_ok_h} día(s)). "
-                        "Los datos del mes en curso NO se modificaron."
-                    )
-                    if dias_omitidos_h:
-                        mensaje_h += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos_h))}."
-                    st.success(mensaje_h)
+                if dias_ok > 0:
+                    verbo = "reemplazaron" if reemplazar_horizontal else "sumaron"
+                    mensaje = f"Se {verbo} {dias_ok} día(s) de {producto_horizontal} para {int(mes_horizontal)}/{int(anio_horizontal)}."
+                    if dias_omitidos:
+                        mensaje += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos))}."
+                    st.success(mensaje)
 
-    st.markdown("---")
+    with st.expander("📅➕ Cargar ventas diarias de un MES ANTERIOR (histórico)"):
+        st.caption(
+            "Para poder comparar M0 vs M-1 'mismo día contra mismo día' en Vista Gerencial, en vez del "
+            "total del mes completo. Esta carga NO toca los datos del mes en curso — solo alimenta el "
+            "histórico. Acepta CUALQUIERA de estos 2 formatos de columnas (uses el que ya tengas armado):"
+        )
+        st.code(
+            "DNI | Nombre | Departamento | Provincia | Distrito | PDV | Nombre PDV | 1 | 2 | 3 | ... | 31\n"
+            "DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | 1 | 2 | 3 | ... | 31",
+            language=None,
+        )
+        st.caption(
+            "Obligatorias: el identificador de PDV (**PDV** o **DNI PDV**) y el de Gestor "
+            "(**DNI** o **DNI Gestor**), y al menos una columna de día. "
+            "Nombre/Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas — si "
+            "las omites, se completan buscando el DNI del gestor en lo ya publicado este mes (y si "
+            "tampoco se encuentra ahí, quedan vacías)."
+        )
+
+        col_prod_hh, col_mes_hh, col_anio_hh = st.columns(3)
+        with col_prod_hh:
+            producto_hist_horizontal = st.selectbox("Producto de este archivo", PRODUCTOS, key="producto_hist_horizontal")
+        with col_mes_hh:
+            mes_hist_horizontal = st.number_input(
+                "Mes (el mes anterior, no el actual)", min_value=1, max_value=12, value=datetime.now().month,
+                key="mes_hist_horizontal",
+            )
+        with col_anio_hh:
+            anio_hist_horizontal = st.number_input(
+                "Año", min_value=2020, max_value=2100, value=datetime.now().year, step=1, key="anio_hist_horizontal",
+            )
+
+        archivo_hist_horizontal = st.file_uploader(
+            "Excel de ventas diarias históricas (formato horizontal)", type=["xlsx"], key="uploader_hist_horizontal",
+        )
+        departamentos_alcance_hist_horizontal = st.multiselect(
+            "Aplicar solo a estos departamentos (opcional — vacío = todos los que traiga el archivo)",
+            options=departamentos_disponibles_admin, default=[], key="depto_alcance_hist_horizontal",
+        )
+
+        if archivo_hist_horizontal is not None and st.button("Procesar histórico diario"):
+            df_referencia_hist, _, mes_actual_check, anio_actual_check = obtener_datos_publicados()
+            if int(mes_hist_horizontal) == int(mes_actual_check) and int(anio_hist_horizontal) == int(anio_actual_check):
+                st.error(
+                    f"⚠️ Seleccionaste {int(mes_hist_horizontal)}/{int(anio_hist_horizontal)}, pero ese es el MES "
+                    "ACTUAL (el que ya está publicado en Vista Gerencial), no un mes anterior. Si subes aquí el mes "
+                    "actual, la comparación M0 vs M-1 se distorsiona. Cambia el Mes/Año arriba al mes que sí quieres "
+                    "guardar como histórico (ej. si agosto es el actual, aquí va julio)."
+                )
+            else:
+                try:
+                    df_hist_horizontal = leer_excel_seguro(archivo_hist_horizontal)
+                except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
+                    st.error(f"No se pudo leer el archivo: {exc}")
+                    df_hist_horizontal = None
+
+                if df_hist_horizontal is not None:
+                    if departamentos_alcance_hist_horizontal and "Departamento" in df_hist_horizontal.columns:
+                        df_hist_horizontal = df_hist_horizontal[
+                            df_hist_horizontal["Departamento"].isin(departamentos_alcance_hist_horizontal)
+                        ]
+                    try:
+                        dias_ok_h, dias_omitidos_h = procesar_carga_horizontal_historica(
+                            df_hist_horizontal, producto_hist_horizontal,
+                            int(mes_hist_horizontal), int(anio_hist_horizontal), df_referencia_hist,
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        dias_ok_h, dias_omitidos_h = 0, []
+
+                    if dias_ok_h > 0:
+                        mensaje_h = (
+                            f"Se guardó el histórico diario de {producto_hist_horizontal} para "
+                            f"{int(mes_hist_horizontal)}/{int(anio_hist_horizontal)} ({dias_ok_h} día(s)). "
+                            "Los datos del mes en curso NO se modificaron."
+                        )
+                        if dias_omitidos_h:
+                            mensaje_h += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos_h))}."
+                        st.success(mensaje_h)
+
     with st.expander("🗑️ Borrar TODOS los datos (reiniciar la app desde cero)"):
         st.warning(
-            "Esto borra TODO lo publicado: el mes actual, el histórico de meses anteriores, "
-            "el detalle diario y los datos de visitas del BO. No se puede deshacer. Úsalo solo "
-            "si quieres empezar de cero (por ejemplo, para hacer pruebas limpias)."
+            "Borra lo publicado: el mes actual, el histórico de meses anteriores y el detalle diario. "
+            "No se puede deshacer. Úsalo solo si quieres empezar de cero (por ejemplo, para hacer "
+            "pruebas limpias)."
         )
-        confirmar_borrado = st.checkbox("Sí, entiendo que esto borra todo y no se puede deshacer", key="confirmar_borrado_total")
-        if st.button("🗑️ Borrar todo y reiniciar", disabled=not confirmar_borrado):
-            archivos_a_borrar = [DATA_FILE, DATA_META, VISITAS_FILE, HISTORIAL_DIARIO_FILE]
-            borrados = []
-            for ruta in archivos_a_borrar:
-                if os.path.exists(ruta):
-                    os.remove(ruta)
-                    borrados.append(os.path.basename(ruta))
-            if os.path.isdir(HISTORICO_DIR):
-                for nombre_archivo in os.listdir(HISTORICO_DIR):
-                    os.remove(os.path.join(HISTORICO_DIR, nombre_archivo))
-                borrados.append("historico/*")
+        departamentos_borrar = st.multiselect(
+            "Borrar solo estos departamentos (opcional — vacío = borrar TODO, incluidos los datos de "
+            "visitas del BO, que no se pueden filtrar por departamento)",
+            options=departamentos_disponibles_admin, default=[], key="depto_borrar",
+        )
+        confirmar_borrado = st.checkbox("Sí, entiendo que esto borra datos y no se puede deshacer", key="confirmar_borrado_total")
+        if st.button("🗑️ Borrar y reiniciar", disabled=not confirmar_borrado):
+            if not departamentos_borrar:
+                # Borrado TOTAL — igual que antes.
+                archivos_a_borrar = [DATA_FILE, DATA_META, VISITAS_FILE, HISTORIAL_DIARIO_FILE]
+                borrados = []
+                for ruta in archivos_a_borrar:
+                    if os.path.exists(ruta):
+                        os.remove(ruta)
+                        borrados.append(os.path.basename(ruta))
+                if os.path.isdir(HISTORICO_DIR):
+                    for nombre_archivo in os.listdir(HISTORICO_DIR):
+                        os.remove(os.path.join(HISTORICO_DIR, nombre_archivo))
+                    borrados.append("historico/*")
+                mensaje_borrado = f"Listo, se borró todo: {', '.join(borrados) if borrados else '(no había nada que borrar)'}."
+            else:
+                # Borrado SOLO de los departamentos elegidos — se conserva el resto.
+                tocados = []
+                if os.path.exists(DATA_FILE):
+                    df_actual_borrar, dia_c, mes_c, anio_c = obtener_datos_publicados()
+                    quedan = df_actual_borrar[~df_actual_borrar["Departamento"].isin(departamentos_borrar)]
+                    if quedan.empty:
+                        os.remove(DATA_FILE)
+                        if os.path.exists(DATA_META):
+                            os.remove(DATA_META)
+                    else:
+                        publicar_datos(quedan, dia_c, mes_c, anio_c)
+                    tocados.append("mes actual")
+
+                if os.path.isdir(HISTORICO_DIR):
+                    for nombre_archivo in os.listdir(HISTORICO_DIR):
+                        ruta_hist = os.path.join(HISTORICO_DIR, nombre_archivo)
+                        df_hist_borrar = leer_excel_seguro(ruta_hist)
+                        if "Departamento" in df_hist_borrar.columns:
+                            quedan_hist = df_hist_borrar[~df_hist_borrar["Departamento"].isin(departamentos_borrar)]
+                            if quedan_hist.empty:
+                                os.remove(ruta_hist)
+                            else:
+                                _normalizar_identidad(quedan_hist).to_excel(ruta_hist, index=False)
+                    tocados.append("histórico")
+
+                if os.path.exists(HISTORIAL_DIARIO_FILE):
+                    historial_borrar = obtener_historial_diario()
+                    if "Departamento" in historial_borrar.columns:
+                        queda_historial = historial_borrar[~historial_borrar["Departamento"].isin(departamentos_borrar)]
+                        if queda_historial.empty:
+                            os.remove(HISTORIAL_DIARIO_FILE)
+                        else:
+                            queda_historial.to_excel(HISTORIAL_DIARIO_FILE, index=False)
+                    tocados.append("detalle diario")
+
+                mensaje_borrado = f"Listo, se borraron los datos de {', '.join(departamentos_borrar)} en: {', '.join(tocados)}."
+
             _leer_excel_publicado.clear()
             _leer_historial_diario_cacheado.clear()
             generar_datos_ejemplo.clear()
-            st.success(f"Listo, se borró todo: {', '.join(borrados) if borrados else '(no había nada que borrar)'}. Recarga la página.")
+            st.success(mensaje_borrado + " Recarga la página.")
 
 
 # =============================================================================
