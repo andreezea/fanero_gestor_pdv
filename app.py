@@ -753,6 +753,55 @@ def publicar_datos_incremental(
         registrar_incremento_diario(df_nuevo, fecha_publicacion)
 
 
+def publicar_datos_reemplazo_parcial(
+    df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int, registrar_historial: bool = True,
+) -> None:
+    """Como `publicar_datos_incremental`, pero en vez de SUMAR el Avance
+    nuevo al ya publicado, lo REEMPLAZA (sobreescribe) para los DNI+PDV+
+    Producto que traiga el archivo — sin tocar nada más de lo que ya está
+    publicado (otros productos, otros PDV). Útil para volver a subir un
+    rango de días ya cargado antes (corrige un error) sin que se duplique.
+
+    Si el Mes/Año es distinto al publicado, se comporta igual que
+    `publicar_datos_incremental` (archiva el mes saliente y empieza de cero).
+    """
+    df_nuevo = _normalizar_identidad(df_nuevo)
+
+    hay_publicacion_previa = os.path.exists(DATA_FILE)
+    mismo_periodo = False
+    if hay_publicacion_previa:
+        df_actual, _, mes_actual, anio_actual = obtener_datos_publicados()
+        mismo_periodo = (int(mes_actual) == int(mes)) and (int(anio_actual) == int(anio))
+        if not mismo_periodo:
+            _archivar_mes(df_actual, mes_actual, anio_actual)
+
+    if not mismo_periodo:
+        publicar_datos(df_nuevo, dia_corte, mes, anio)
+    else:
+        claves = ["DNI", "PDV", "Producto"]
+        df_actual = _normalizar_identidad(df_actual)
+        base = df_actual.set_index(claves)
+        nuevo = df_nuevo.set_index(claves)
+
+        # Reemplaza (no suma) Avance y Cuota para las filas que trae el
+        # archivo nuevo; todo lo demás en `base` queda intacto.
+        claves_comunes = base.index.intersection(nuevo.index)
+        base.loc[claves_comunes, "Avance"] = nuevo.loc[claves_comunes, "Avance"]
+        if "Cuota" in nuevo.columns:
+            base.loc[claves_comunes, "Cuota"] = nuevo.loc[claves_comunes, "Cuota"]
+
+        claves_nuevas = nuevo.index.difference(base.index)
+        filas_nuevas = nuevo.loc[claves_nuevas]
+
+        combinado = pd.concat([base, filas_nuevas]).reset_index()
+        publicar_datos(combinado, dia_corte, mes, anio)
+
+    if registrar_historial:
+        ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
+        fecha_publicacion = pd.Timestamp(year=anio, month=mes, day=min(dia_corte, ultimo_dia_mes))
+        registrar_incremento_diario(df_nuevo, fecha_publicacion)
+
+
 def calcular_metricas(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> pd.DataFrame:
     """Calcula las columnas derivadas del análisis (Cuota/Avance son
     unidades, no montos en dinero). Se calculan a nivel de fila (PDV × Producto):
@@ -1509,7 +1558,7 @@ def _credenciales_admin() -> tuple[str, str]:
 
 
 def procesar_carga_horizontal_diaria(
-    df_horizontal: pd.DataFrame, producto: str, mes: int, anio: int,
+    df_horizontal: pd.DataFrame, producto: str, mes: int, anio: int, reemplazar: bool = False,
 ) -> tuple[int, list[int]]:
     """Convierte una plantilla HORIZONTAL (una columna por día del mes, con
     el nombre de columna = número de día: 1, 2, 3... 31) en publicaciones
@@ -1517,6 +1566,11 @@ def procesar_carga_horizontal_diaria(
     `publicar_datos_incremental` (suma al acumulado, archiva historial
     diario) — así el resultado es idéntico a haber publicado día por día,
     pero en un solo archivo.
+
+    `reemplazar=True`: en vez de SUMAR el total de este archivo a lo ya
+    publicado, lo REEMPLAZA para los DNI+PDV+Producto que traiga (sin
+    tocar otros productos/PDV) — usar esto si vas a volver a subir el
+    MISMO rango de días que ya habías cargado antes (para no duplicar).
 
     Columnas esperadas: DNI, Nombre, Departamento, Provincia, Distrito, PDV,
     Nombre PDV, y luego una columna por cada día con la venta de ESE día
@@ -1600,7 +1654,8 @@ def procesar_carga_horizontal_diaria(
             ).agg(Avance=("Avance", "sum"), Cuota=("Cuota", "max"))
         )
         ultimo_dia_con_datos = max(dia for dia, _ in columnas_dia if dia not in dias_omitidos)
-        publicar_datos_incremental(
+        funcion_publicar = publicar_datos_reemplazo_parcial if reemplazar else publicar_datos_incremental
+        funcion_publicar(
             df_incremento_total, dia_corte=ultimo_dia_con_datos, mes=mes, anio=anio, registrar_historial=False,
         )
         registrar_incrementos_diarios_lote(entradas_lote)
@@ -1906,6 +1961,11 @@ def panel_admin() -> None:
     archivo_horizontal = st.file_uploader(
         "Excel de ventas diarias (formato horizontal)", type=["xlsx"], key="uploader_horizontal_diario",
     )
+    reemplazar_horizontal = st.checkbox(
+        "⚠️ Reemplazar en vez de sumar (usa esto si vas a volver a subir el MISMO rango de días "
+        "que ya habías cargado antes, para no duplicar)",
+        key="reemplazar_horizontal",
+    )
 
     if archivo_horizontal is not None and st.button("Procesar y publicar ventas diarias"):
         try:
@@ -1918,13 +1978,15 @@ def panel_admin() -> None:
             try:
                 dias_ok, dias_omitidos = procesar_carga_horizontal_diaria(
                     df_horizontal, producto_horizontal, int(mes_horizontal), int(anio_horizontal),
+                    reemplazar=reemplazar_horizontal,
                 )
             except ValueError as exc:
                 st.error(str(exc))
                 dias_ok, dias_omitidos = 0, []
 
             if dias_ok > 0:
-                mensaje = f"Se publicaron {dias_ok} día(s) de {producto_horizontal} para {int(mes_horizontal)}/{int(anio_horizontal)}."
+                verbo = "reemplazaron" if reemplazar_horizontal else "sumaron"
+                mensaje = f"Se {verbo} {dias_ok} día(s) de {producto_horizontal} para {int(mes_horizontal)}/{int(anio_horizontal)}."
                 if dias_omitidos:
                     mensaje += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos))}."
                 st.success(mensaje)
