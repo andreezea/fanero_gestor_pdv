@@ -292,6 +292,18 @@ _MAPA_DEPARTAMENTO_CANONICO = {_normalizar_texto_simple(d): d for d in DEPARTAME
 _MAPA_PRODUCTO_CANONICO = {_normalizar_texto_simple(p): p for p in PRODUCTOS}
 
 
+def filtrar_por_departamentos_normalizado(df: pd.DataFrame, departamentos_elegidos: list) -> pd.DataFrame:
+    """Filtra `df` por Departamento comparando de forma normalizada
+    (sin importar mayúsculas/tildes) — evita que un archivo con
+    'LORETO' quede afuera solo porque el filtro dice 'Loreto'.
+    Si `departamentos_elegidos` está vacío, devuelve `df` sin tocar."""
+    if not departamentos_elegidos or "Departamento" not in df.columns:
+        return df
+    elegidos_normalizados = {_normalizar_texto_simple(d) for d in departamentos_elegidos}
+    coincide = df["Departamento"].map(lambda v: _normalizar_texto_simple(v) in elegidos_normalizados)
+    return df[coincide]
+
+
 # Columnas que deben leerse SIEMPRE como texto: si un DNI o código de PDV
 # tiene ceros a la izquierda (ej. "05336082"), pandas los interpreta como
 # número al leer el Excel y los pierde ("5336082") — dtype=str lo evita.
@@ -2076,8 +2088,7 @@ def panel_admin() -> None:
                 df_ancho = None
 
             if df_ancho is not None:
-                if departamentos_alcance_m1 and "Departamento" in df_ancho.columns:
-                    df_ancho = df_ancho[df_ancho["Departamento"].isin(departamentos_alcance_m1)]
+                df_ancho = filtrar_por_departamentos_normalizado(df_ancho, departamentos_alcance_m1)
                 df_referencia, _, _, _ = obtener_datos_publicados()
                 try:
                     resultados = procesar_carga_historico_ancho(df_ancho, int(anio_historico), df_referencia)
@@ -2133,8 +2144,7 @@ def panel_admin() -> None:
                 df_horizontal = None
 
             if df_horizontal is not None:
-                if departamentos_alcance_horizontal:
-                    df_horizontal = df_horizontal[df_horizontal["Departamento"].isin(departamentos_alcance_horizontal)]
+                df_horizontal = filtrar_por_departamentos_normalizado(df_horizontal, departamentos_alcance_horizontal)
                 try:
                     dias_ok, dias_omitidos = procesar_carga_horizontal_diaria(
                         df_horizontal, producto_horizontal, int(mes_horizontal), int(anio_horizontal),
@@ -2214,10 +2224,9 @@ def panel_admin() -> None:
                     df_hist_horizontal = None
 
                 if df_hist_horizontal is not None:
-                    if departamentos_alcance_hist_horizontal and "Departamento" in df_hist_horizontal.columns:
-                        df_hist_horizontal = df_hist_horizontal[
-                            df_hist_horizontal["Departamento"].isin(departamentos_alcance_hist_horizontal)
-                        ]
+                    df_hist_horizontal = filtrar_por_departamentos_normalizado(
+                        df_hist_horizontal, departamentos_alcance_hist_horizontal
+                    )
                     try:
                         dias_ok_h, dias_omitidos_h = procesar_carga_horizontal_historica(
                             df_hist_horizontal, producto_hist_horizontal,
