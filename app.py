@@ -2993,13 +2993,34 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
         datos_grafico = pd.concat(piezas, ignore_index=True)
         datos_grafico = datos_grafico.rename(columns={col_grupo: agrupar_por})
 
+        # Color: el mes ACTUAL usa un color distinto por Departamento/Gestor;
+        # el mes ANTERIOR siempre se ve gris (sin importar el grupo), para
+        # que no se confunda con el actual — la distinción de a qué grupo
+        # pertenece cada línea gris se mantiene en el tooltip y en el trazo
+        # (`detail`), solo no compite por color.
+        GRIS_MES_ANTERIOR = "#9CA3AF"
+        PALETA_GRUPOS = [
+            "#00679E", "#D64545", "#3E9B4F", "#E8A33D", "#7B5EA7",
+            "#2CA9BC", "#C2588B", "#8C6B4F", "#5A7D9A", "#B0A03D",
+        ]
+        grupos_unicos = sorted(datos_grafico[agrupar_por].unique())
+        colores_grupos = (PALETA_GRUPOS * (len(grupos_unicos) // len(PALETA_GRUPOS) + 1))[:len(grupos_unicos)]
+
+        datos_grafico["ColorKey"] = np.where(
+            datos_grafico["Periodo"] == periodo_actual, datos_grafico[agrupar_por], "Mes anterior"
+        )
+
         grafico = (
             alt.Chart(datos_grafico)
             .mark_line(strokeWidth=3.5, point=alt.OverlayMarkDef(size=40))
             .encode(
                 x=alt.X("Día:O", title="Día del mes"),
                 y=alt.Y("Avance:Q", title=f"Venta diaria ({producto_base_grafico})", scale=alt.Scale(zero=True)),
-                color=alt.Color(f"{agrupar_por}:N", title=agrupar_por),
+                color=alt.Color(
+                    "ColorKey:N", title=agrupar_por,
+                    scale=alt.Scale(domain=grupos_unicos + ["Mes anterior"], range=colores_grupos + [GRIS_MES_ANTERIOR]),
+                ),
+                detail=alt.Detail(f"{agrupar_por}:N"),  # evita que Altair una todas las líneas grises en una sola
                 strokeDash=alt.StrokeDash("Periodo:N", title="Periodo", sort=[periodo_actual, periodo_anterior]),
                 tooltip=[
                     alt.Tooltip("Periodo:N", title="Periodo"),
