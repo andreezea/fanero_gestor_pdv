@@ -774,6 +774,44 @@ def publicar_datos_incremental(
         registrar_incremento_diario(df_nuevo, fecha_publicacion)
 
 
+def recalcular_avance_desde_historial_diario(departamentos: list, mes: int, anio: int) -> tuple[int, float]:
+    """Herramienta de recuperación: recalcula el Avance publicado (el
+    'número en vivo' de Vista Gerencial) sumando el historial diario real
+    de esos departamentos para este Mes/Año, y lo REEMPLAZA en lo publicado
+    — sin tocar Cuota. Sirve para cuando un '⚠️ REEMPLAZAR' con una
+    plantilla sin columna Avance (ej. 'solo cuota') puso el Avance en 0 por
+    accidente, pero el detalle diario sigue intacto.
+
+    Devuelve (cantidad_de_filas_corregidas, avance_total_restaurado).
+    """
+    if not os.path.exists(DATA_FILE):
+        return 0, 0.0
+
+    df_actual, dia_corte, mes_actual, anio_actual = obtener_datos_publicados()
+    if int(mes_actual) != int(mes) or int(anio_actual) != int(anio):
+        return 0, 0.0  # el mes publicado no es el que se pide recalcular
+
+    historial = obtener_historial_diario()
+    if historial.empty or "PDV" not in historial.columns:
+        return 0, 0.0
+
+    historial_alcance = historial[
+        (historial["Fecha"].dt.year == anio) & (historial["Fecha"].dt.month == mes)
+        & (historial["Departamento"].isin(departamentos))
+    ]
+    if historial_alcance.empty:
+        return 0, 0.0
+
+    avance_real = historial_alcance.groupby(["DNI", "PDV", "Producto"])["Avance"].sum()
+
+    df_actual = _normalizar_identidad(df_actual).set_index(["DNI", "PDV", "Producto"])
+    claves_a_corregir = avance_real.index.intersection(df_actual.index)
+    df_actual.loc[claves_a_corregir, "Avance"] = avance_real.loc[claves_a_corregir]
+
+    publicar_datos(df_actual.reset_index(), dia_corte, mes, anio)
+    return len(claves_a_corregir), float(avance_real.loc[claves_a_corregir].sum())
+
+
 def publicar_datos_reemplazo_total_con_alcance(
     df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int, departamentos_alcance: list | None = None,
 ) -> None:
@@ -1932,6 +1970,23 @@ def panel_admin() -> None:
             )
 
         if archivo is not None:
+            if hasattr(archivo, "seek"):
+                archivo.seek(0)
+            try:
+                columnas_archivo_raw = set(leer_excel_seguro(archivo).columns)
+            except Exception:  # noqa: BLE001
+                columnas_archivo_raw = set()
+            trae_avance = "Avance" in columnas_archivo_raw
+
+            if forzar_reemplazo and not trae_avance:
+                st.error(
+                    "🚨 **Cuidado**: este archivo NO trae la columna 'Avance' (parece la plantilla SOLO CUOTA) "
+                    "y tienes REEMPLAZAR activado. Esto va a **borrar el Avance real** (ponerlo en 0) de los "
+                    "departamentos que elijas abajo, aunque ya tengan ventas cargadas — solo se conserva la "
+                    "Cuota. Si tu intención es solo actualizar cuotas sin tocar ventas, **desmarca "
+                    "REEMPLAZAR** (usa el modo SUMAR normal, que si conserva el Avance existente)."
+                )
+
             df_preview = cargar_datos_excel(archivo)
             if df_preview is not None and not forzar_reemplazo:
                 avance_nuevo = df_preview["Avance"].sum()
@@ -2175,6 +2230,38 @@ def panel_admin() -> None:
                         if dias_omitidos_h:
                             mensaje_h += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos_h))}."
                         st.success(mensaje_h)
+
+    with st.expander("🔧 Recalcular Avance desde el historial diario (recuperación)"):
+        st.info(
+            "Úsala si un '⚠️ REEMPLAZAR' (por ejemplo, con la plantilla SOLO CUOTA) dejó el Avance "
+            "en 0 por accidente en algún departamento — recalcula el Avance sumando el detalle diario "
+            "real que ya tenías cargado, sin tocar la Cuota. Si nunca cargaste el detalle diario de "
+            "ese departamento, no hay nada que recuperar (no había de dónde sacar el dato)."
+        )
+        if os.path.exists(DATA_FILE):
+            df_recuperacion_ref, _, mes_recuperacion, anio_recuperacion = obtener_datos_publicados()
+            departamentos_recuperar = st.multiselect(
+                "Departamento(s) a recalcular",
+                options=sorted(df_recuperacion_ref["Departamento"].unique()), default=[], key="depto_recalcular",
+            )
+            if st.button("🔧 Recalcular Avance ahora", disabled=not departamentos_recuperar):
+                filas_corregidas, avance_restaurado = recalcular_avance_desde_historial_diario(
+                    departamentos_recuperar, int(mes_recuperacion), int(anio_recuperacion),
+                )
+                if filas_corregidas > 0:
+                    st.success(
+                        f"Se recalculó el Avance de {filas_corregidas} fila(s) en "
+                        f"{', '.join(departamentos_recuperar)}: total restaurado = {avance_restaurado:,.0f}. "
+                        "Recarga la página."
+                    )
+                else:
+                    st.warning(
+                        "No se encontró detalle diario para ese/esos departamento(s) en el mes actual — "
+                        "no hay nada que recalcular (si nunca subiste el detalle diario, no se puede "
+                        "recuperar el Avance perdido)."
+                    )
+        else:
+            st.caption("No hay datos publicados todavía.")
 
     with st.expander("🗑️ Borrar TODOS los datos (reiniciar la app desde cero)"):
         st.warning(
