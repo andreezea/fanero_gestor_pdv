@@ -480,14 +480,24 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
 
     Devuelve {mes_numero: DataFrame_listo_para_archivar}.
     """
-    columnas_obligatorias = {"DNI PDV", "DNI Gestor", "Mes"}
+    columnas_obligatorias = {"Mes"}
     faltantes_obligatorias = columnas_obligatorias - set(df_ancho.columns)
     if faltantes_obligatorias:
         raise ValueError("Faltan columnas obligatorias: " + ", ".join(sorted(faltantes_obligatorias)))
 
+    col_pdv_origen = "DNI PDV" if "DNI PDV" in df_ancho.columns else ("PDV" if "PDV" in df_ancho.columns else None)
+    col_gestor_origen = "DNI Gestor" if "DNI Gestor" in df_ancho.columns else ("DNI" if "DNI" in df_ancho.columns else None)
+    faltantes_id = []
+    if col_pdv_origen is None:
+        faltantes_id.append("DNI PDV (o PDV)")
+    if col_gestor_origen is None:
+        faltantes_id.append("DNI Gestor (o DNI)")
+    if faltantes_id:
+        raise ValueError("Faltan columnas obligatorias: " + ", ".join(faltantes_id))
+
     df_ancho = df_ancho.copy()
-    df_ancho["PDV"] = df_ancho["DNI PDV"].astype(str).str.strip()
-    df_ancho["DNI"] = df_ancho["DNI Gestor"].astype(str).str.strip()
+    df_ancho["PDV"] = df_ancho[col_pdv_origen].astype(str).str.strip()
+    df_ancho["DNI"] = df_ancho[col_gestor_origen].astype(str).str.strip()
     # Si no se conoce el DNI Gestor de un PDV (celda vacía), se agrupa bajo
     # un "gestor" placeholder claro — así el Departamento sigue sumando bien
     # (no depende del Gestor), y en la Vista Gerencial por Gestor aparece
@@ -498,7 +508,8 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
     df_ancho["_MesNumero"] = df_ancho["_MesTexto"].map(MESES_ES)
 
     columnas_geo_presentes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c in df_ancho.columns]
-    columnas_excluir = {"DNI PDV", "DNI Gestor", "Mes", "PDV", "DNI", "_MesTexto", "_MesNumero"} | set(columnas_geo_presentes)
+    nombre_gestor_presente = "Nombre" in df_ancho.columns
+    columnas_excluir = {"DNI PDV", "DNI Gestor", "Mes", "PDV", "DNI", "Nombre", "_MesTexto", "_MesNumero"} | set(columnas_geo_presentes)
 
     mapa_col_producto = {}
     for col in df_ancho.columns:
@@ -522,7 +533,8 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
     # (Nombre PDV/Departamento/Provincia/Distrito), se busca en lo ya
     # publicado este mes. "Nombre" (del gestor) se maneja aparte abajo.
     columnas_geo_faltantes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c not in columnas_geo_presentes]
-    ref_cols = [c for c in (["DNI"] + columnas_geo_faltantes + ["Nombre"]) if c in df_referencia.columns]
+    columnas_respaldo = columnas_geo_faltantes + ([] if nombre_gestor_presente else ["Nombre"])
+    ref_cols = [c for c in (["DNI"] + columnas_respaldo) if c in df_referencia.columns]
     ref = df_referencia[ref_cols].drop_duplicates(subset=["DNI"]) if "DNI" in ref_cols and len(ref_cols) > 1 else pd.DataFrame(columns=["DNI"])
 
     resultados: dict[int, pd.DataFrame] = {}
@@ -536,6 +548,8 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
                 fila_nueva = {"DNI": fila["DNI"], "PDV": fila["PDV"], "Producto": producto, "Avance": float(valor)}
                 for col_geo in columnas_geo_presentes:
                     fila_nueva[col_geo] = fila[col_geo]
+                if nombre_gestor_presente:
+                    fila_nueva["Nombre"] = fila["Nombre"]
                 filas.append(fila_nueva)
         df_largo = pd.DataFrame(filas)
         if df_largo.empty:
@@ -560,36 +574,53 @@ def procesar_carga_historico_ancho(df_ancho: pd.DataFrame, anio: int, df_referen
 
     return resultados
 
-def registrar_incremento_diario(df_incremento: pd.DataFrame, fecha: "pd.Timestamp") -> None:
-    """Guarda, con fecha, lo que se sumó en ESTA publicación (por Gestor,
-    PDV y Producto) — es la base para el gráfico de 'Ventas diarias' y para
-    la comparación M0 vs M-1 'mismo día contra mismo día'. Si ya existía un
-    registro para esa misma Fecha+DNI+PDV+Producto (se volvió a publicar el
-    mismo día), se reemplaza en vez de duplicar."""
+def registrar_incrementos_diarios_lote(entradas: list) -> None:
+    """Como `registrar_incremento_diario`, pero para VARIOS días a la vez —
+    hace UNA sola lectura y UNA sola escritura del archivo (en vez de una
+    por cada día), mucho más rápido para cargas de muchos días/PDV.
+    `entradas` es una lista de tuplas (df_incremento, fecha)."""
     columnas = ["DNI", "Nombre", "Departamento", "PDV", "Producto"]
-    columnas_presentes = [c for c in columnas if c in df_incremento.columns]
-    agregado = (
-        df_incremento.groupby(columnas_presentes, as_index=False)["Avance"].sum()
-    )
-    agregado["Fecha"] = pd.Timestamp(fecha)
+    agregados = []
+    for df_incremento, fecha in entradas:
+        columnas_presentes = [c for c in columnas if c in df_incremento.columns]
+        agregado = df_incremento.groupby(columnas_presentes, as_index=False)["Avance"].sum()
+        agregado["Fecha"] = pd.Timestamp(fecha)
+        agregados.append(agregado)
 
+    if not agregados:
+        return
+
+    nuevo = pd.concat(agregados, ignore_index=True)
+    columnas_presentes = [c for c in columnas if c in nuevo.columns]
     claves = ["Fecha", "DNI", "Producto"] + (["PDV"] if "PDV" in columnas_presentes else [])
 
     if os.path.exists(HISTORIAL_DIARIO_FILE):
         historial = leer_excel_seguro(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
         historial["DNI"] = historial["DNI"].astype(str).str.strip()  # evita que Excel lo lea como número
-        agregado["DNI"] = agregado["DNI"].astype(str).str.strip()
+        nuevo["DNI"] = nuevo["DNI"].astype(str).str.strip()
         if "PDV" in claves and "PDV" not in historial.columns:
             historial["PDV"] = ""  # archivo viejo sin columna PDV: se completa vacía
         historial = historial.set_index(claves)
-        nuevo = agregado.set_index(claves)
-        historial = historial.drop(index=historial.index.intersection(nuevo.index), errors="ignore")
-        historial = pd.concat([historial.reset_index(), nuevo.reset_index()], ignore_index=True)
+        nuevo_idx = nuevo.set_index(claves)
+        historial = historial.drop(index=historial.index.intersection(nuevo_idx.index), errors="ignore")
+        historial = pd.concat([historial.reset_index(), nuevo_idx.reset_index()], ignore_index=True)
     else:
-        historial = agregado
+        historial = nuevo
 
     os.makedirs(DATA_DIR, exist_ok=True)
     historial.to_excel(HISTORIAL_DIARIO_FILE, index=False)
+
+
+def registrar_incremento_diario(df_incremento: pd.DataFrame, fecha: "pd.Timestamp") -> None:
+    """Guarda, con fecha, lo que se sumó en ESTA publicación (por Gestor,
+    PDV y Producto) — es la base para el gráfico de 'Ventas diarias' y para
+    la comparación M0 vs M-1 'mismo día contra mismo día'. Si ya existía un
+    registro para esa misma Fecha+DNI+PDV+Producto (se volvió a publicar el
+    mismo día), se reemplaza en vez de duplicar.
+
+    Para registrar VARIOS días de una sola vez (mucho más rápido — una sola
+    lectura/escritura de archivo), usar `registrar_incrementos_diarios_lote`."""
+    registrar_incrementos_diarios_lote([(df_incremento, fecha)])
 
 
 def obtener_historial_diario() -> pd.DataFrame:
@@ -654,11 +685,18 @@ def avance_acumulado_hasta_dia_por_pdv(mes: int, anio: int, dia_corte: int, prod
     return subset.groupby("PDV")["Avance"].sum()
 
 
-def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int) -> None:
+def publicar_datos_incremental(
+    df_nuevo: pd.DataFrame, dia_corte: int, mes: int, anio: int, registrar_historial: bool = True,
+) -> None:
     """Publica una carga SUMANDO el Avance nuevo al acumulado ya publicado
     del mismo Mes/Año (en vez de reemplazarlo). Así el administrador puede
     subir solo lo vendido en el día/periodo más reciente, y la app se
     encarga de mantener el acumulado del mes.
+
+    `registrar_historial=False` evita registrar este incremento en
+    `historial_diario` — se usa cuando el llamador ya lo va a registrar por
+    su cuenta (ej. `procesar_carga_horizontal_diaria`, que registra todos
+    los días de una sola vez en lote, mucho más rápido que uno por uno).
 
     Reglas:
     - DNI + PDV + Producto ya existentes este mes → Avance se SUMA;
@@ -683,9 +721,10 @@ def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int,
     if not mismo_periodo:
         # Primera carga del mes (o primera carga de todas): no hay nada que sumar.
         publicar_datos(df_nuevo, dia_corte, mes, anio)
-        ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
-        fecha_publicacion = pd.Timestamp(year=anio, month=mes, day=min(dia_corte, ultimo_dia_mes))
-        registrar_incremento_diario(df_nuevo, fecha_publicacion)
+        if registrar_historial:
+            ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
+            fecha_publicacion = pd.Timestamp(year=anio, month=mes, day=min(dia_corte, ultimo_dia_mes))
+            registrar_incremento_diario(df_nuevo, fecha_publicacion)
         return
 
     claves = ["DNI", "PDV", "Producto"]
@@ -708,9 +747,10 @@ def publicar_datos_incremental(df_nuevo: pd.DataFrame, dia_corte: int, mes: int,
 
     # Registra el incremento de ESTA publicación con su fecha, para el
     # gráfico de "Ventas diarias" en Vista Gerencial.
-    ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
-    fecha_publicacion = pd.Timestamp(year=anio, month=mes, day=min(dia_corte, ultimo_dia_mes))
-    registrar_incremento_diario(df_nuevo, fecha_publicacion)
+    if registrar_historial:
+        ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
+        fecha_publicacion = pd.Timestamp(year=anio, month=mes, day=min(dia_corte, ultimo_dia_mes))
+        registrar_incremento_diario(df_nuevo, fecha_publicacion)
 
 
 def calcular_metricas(df: pd.DataFrame, dias_en_mes: int, dia_corte: int) -> pd.DataFrame:
@@ -1522,6 +1562,8 @@ def procesar_carga_horizontal_diaria(
 
     dias_procesados = 0
     dias_omitidos = []
+    entradas_lote = []
+    filas_incremento_total = []
 
     for numero_dia, nombre_columna in columnas_dia:
         columnas_a_tomar = columnas_identidad + [nombre_columna]
@@ -1540,8 +1582,28 @@ def procesar_carga_horizontal_diaria(
 
         ultimo_dia_mes = calendar.monthrange(anio, mes)[1]
         dia_corte_valido = min(numero_dia, ultimo_dia_mes)
-        publicar_datos_incremental(df_dia, dia_corte=dia_corte_valido, mes=mes, anio=anio)
+        fecha_dia = pd.Timestamp(year=anio, month=mes, day=dia_corte_valido)
+        entradas_lote.append((df_dia, fecha_dia))
+        filas_incremento_total.append(df_dia)
         dias_procesados += 1
+
+    if filas_incremento_total:
+        # UNA sola publicación con la SUMA de todos los días (en vez de una
+        # publicación por día — mucho más rápido, mismo resultado final ya
+        # que sumar es asociativo). El detalle día por día para el gráfico
+        # se registra aparte, también en un solo lote.
+        df_incremento_total = pd.concat(filas_incremento_total, ignore_index=True)
+        df_incremento_total = (
+            df_incremento_total.groupby(
+                ["DNI", "Nombre", "Departamento", "Provincia", "Distrito", "PDV", "Nombre PDV", "Producto"],
+                as_index=False,
+            ).agg(Avance=("Avance", "sum"), Cuota=("Cuota", "max"))
+        )
+        ultimo_dia_con_datos = max(dia for dia, _ in columnas_dia if dia not in dias_omitidos)
+        publicar_datos_incremental(
+            df_incremento_total, dia_corte=ultimo_dia_con_datos, mes=mes, anio=anio, registrar_historial=False,
+        )
+        registrar_incrementos_diarios_lote(entradas_lote)
 
     return dias_procesados, dias_omitidos
 
@@ -1558,28 +1620,40 @@ def procesar_carga_horizontal_historica(
        el total del mes completo — para que la comparación de mes
        completo siga funcionando igual que antes.
 
-    Columnas esperadas (igual esquema que la plantilla de M-1, pero con
-    columnas de día en vez de una sola columna "Mes"):
+    Columnas esperadas (acepta CUALQUIERA de estos 2 esquemas, con columnas
+    de día en vez de una sola columna "Mes"):
 
         DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | 1 | 2 | 3 | ... | 31
+        (o, igual que la plantilla de ventas diarias del mes actual:)
+        DNI | Nombre | Departamento | Provincia | Distrito | PDV | Nombre PDV | 1 | 2 | 3 | ... | 31
 
-    Obligatorias: "DNI PDV", "DNI Gestor", y al menos una columna de día.
-    Departamento/Provincia/Distrito/Nombre PDV son opcionales pero muy
-    recomendadas (mismo criterio que `procesar_carga_historico_ancho`).
+    Obligatorias: el identificador de PDV ("DNI PDV" o "PDV") y el
+    identificador de Gestor ("DNI Gestor" o "DNI"), y al menos una columna
+    de día. Departamento/Provincia/Distrito/Nombre PDV son opcionales pero
+    muy recomendadas (mismo criterio que `procesar_carga_historico_ancho`).
     """
-    columnas_obligatorias = {"DNI PDV", "DNI Gestor"}
-    faltantes_obligatorias = columnas_obligatorias - set(df_horizontal.columns)
+    # Acepta ambos esquemas de nombres de columna (evita que el usuario
+    # tenga que recordar cuál plantilla usa qué nombres).
+    col_pdv_origen = "DNI PDV" if "DNI PDV" in df_horizontal.columns else ("PDV" if "PDV" in df_horizontal.columns else None)
+    col_gestor_origen = "DNI Gestor" if "DNI Gestor" in df_horizontal.columns else ("DNI" if "DNI" in df_horizontal.columns else None)
+
+    faltantes_obligatorias = []
+    if col_pdv_origen is None:
+        faltantes_obligatorias.append("DNI PDV (o PDV)")
+    if col_gestor_origen is None:
+        faltantes_obligatorias.append("DNI Gestor (o DNI)")
     if faltantes_obligatorias:
-        raise ValueError("Faltan columnas obligatorias: " + ", ".join(sorted(faltantes_obligatorias)))
+        raise ValueError("Faltan columnas obligatorias: " + ", ".join(faltantes_obligatorias))
 
     df_horizontal = df_horizontal.copy()
-    df_horizontal["PDV"] = df_horizontal["DNI PDV"].astype(str).str.strip()
-    df_horizontal["DNI"] = df_horizontal["DNI Gestor"].astype(str).str.strip()
+    df_horizontal["PDV"] = df_horizontal[col_pdv_origen].astype(str).str.strip()
+    df_horizontal["DNI"] = df_horizontal[col_gestor_origen].astype(str).str.strip()
     sin_gestor_conocido = df_horizontal["DNI"].isna() | (df_horizontal["DNI"].isin(["", "nan", "None"]))
     df_horizontal.loc[sin_gestor_conocido, "DNI"] = "SIN_GESTOR"
 
     columnas_geo_presentes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c in df_horizontal.columns]
-    columnas_excluir = {"DNI PDV", "DNI Gestor", "PDV", "DNI"} | set(columnas_geo_presentes)
+    nombre_gestor_presente = "Nombre" in df_horizontal.columns
+    columnas_excluir = {"DNI PDV", "DNI Gestor", "PDV", "DNI", "Nombre"} | set(columnas_geo_presentes)
 
     columnas_dia = []
     for col in df_horizontal.columns:
@@ -1603,15 +1677,17 @@ def procesar_carga_horizontal_historica(
     # Respaldo por DNI Gestor para geo faltante (mismo criterio que la carga
     # ancha de M-1) y Nombre del gestor con placeholder si no se encuentra.
     columnas_geo_faltantes = [c for c in ["Nombre PDV", "Departamento", "Provincia", "Distrito"] if c not in columnas_geo_presentes]
-    ref_cols = [c for c in (["DNI"] + columnas_geo_faltantes + ["Nombre"]) if c in df_referencia.columns]
+    columnas_respaldo = columnas_geo_faltantes + ([] if nombre_gestor_presente else ["Nombre"])
+    ref_cols = [c for c in (["DNI"] + columnas_respaldo) if c in df_referencia.columns]
     ref = df_referencia[ref_cols].drop_duplicates(subset=["DNI"]) if "DNI" in ref_cols and len(ref_cols) > 1 else pd.DataFrame(columns=["DNI"])
 
     dias_procesados = 0
     dias_omitidos = []
-    filas_totales_mes = []
+    entradas_lote = []  # (df_dia, fecha) de cada día — se registran TODOS juntos al final
 
     for numero_dia, nombre_columna in columnas_dia:
-        columnas_a_tomar = ["DNI", "PDV"] + columnas_geo_presentes + [nombre_columna]
+        columnas_base = ["DNI", "PDV"] + columnas_geo_presentes + (["Nombre"] if nombre_gestor_presente else [])
+        columnas_a_tomar = columnas_base + [nombre_columna]
         df_dia = df_horizontal[columnas_a_tomar].rename(columns={nombre_columna: "Avance"})
         df_dia["Avance"] = pd.to_numeric(df_dia["Avance"], errors="coerce")
         df_dia = df_dia.dropna(subset=["Avance"])
@@ -1635,8 +1711,14 @@ def procesar_carga_horizontal_historica(
         df_dia = _normalizar_identidad(df_dia)
 
         fecha_dia = pd.Timestamp(year=anio, month=mes, day=numero_dia)
-        registrar_incremento_diario(df_dia, fecha_dia)
+        entradas_lote.append((df_dia, fecha_dia))
         dias_procesados += 1
+
+    if entradas_lote:
+        # UNA sola lectura + UNA sola escritura del archivo para TODOS los
+        # días juntos (en vez de una por día) — mucho más rápido con
+        # muchos días/PDV.
+        registrar_incrementos_diarios_lote(entradas_lote)
 
     if dias_procesados > 0:
         # El total archivado se recalcula del HISTORIAL DIARIO COMPLETO de
@@ -1852,18 +1934,19 @@ def panel_admin() -> None:
     st.caption(
         "Para poder comparar M0 vs M-1 'mismo día contra mismo día' en Vista Gerencial, en vez del "
         "total del mes completo. Esta carga NO toca los datos del mes en curso — solo alimenta el "
-        "histórico. Mismo formato que la carga de M-1, pero con una columna por día en vez de una "
-        "sola columna 'Mes':"
+        "histórico. Acepta CUALQUIERA de estos 2 formatos de columnas (uses el que ya tengas armado):"
     )
     st.code(
+        "DNI | Nombre | Departamento | Provincia | Distrito | PDV | Nombre PDV | 1 | 2 | 3 | ... | 31\n"
         "DNI PDV | Nombre PDV | Departamento | Provincia | Distrito | DNI Gestor | 1 | 2 | 3 | ... | 31",
         language=None,
     )
     st.caption(
-        "Obligatorias: **DNI PDV**, **DNI Gestor**, y al menos una columna de día. "
-        "Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas — si las "
-        "omites, se completan buscando el DNI Gestor en lo ya publicado este mes (y si tampoco se "
-        "encuentra ahí, quedan vacías)."
+        "Obligatorias: el identificador de PDV (**PDV** o **DNI PDV**) y el de Gestor "
+        "(**DNI** o **DNI Gestor**), y al menos una columna de día. "
+        "Nombre/Nombre PDV/Departamento/Provincia/Distrito son opcionales pero muy recomendadas — si "
+        "las omites, se completan buscando el DNI del gestor en lo ya publicado este mes (y si "
+        "tampoco se encuentra ahí, quedan vacías)."
     )
 
     col_prod_hh, col_mes_hh, col_anio_hh = st.columns(3)
