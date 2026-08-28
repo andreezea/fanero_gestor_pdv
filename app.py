@@ -2041,32 +2041,64 @@ def panel_admin() -> None:
     )
 
     if archivo_hist_horizontal is not None and st.button("Procesar histórico diario"):
-        try:
-            df_hist_horizontal = leer_excel_seguro(archivo_hist_horizontal)
-        except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
-            st.error(f"No se pudo leer el archivo: {exc}")
-            df_hist_horizontal = None
-
-        if df_hist_horizontal is not None:
-            df_referencia_hist, _, _, _ = obtener_datos_publicados()
+        df_referencia_hist, _, mes_actual_check, anio_actual_check = obtener_datos_publicados()
+        if int(mes_hist_horizontal) == int(mes_actual_check) and int(anio_hist_horizontal) == int(anio_actual_check):
+            st.error(
+                f"⚠️ Seleccionaste {int(mes_hist_horizontal)}/{int(anio_hist_horizontal)}, pero ese es el MES "
+                "ACTUAL (el que ya está publicado en Vista Gerencial), no un mes anterior. Si subes aquí el mes "
+                "actual, la comparación M0 vs M-1 se distorsiona. Cambia el Mes/Año arriba al mes que sí quieres "
+                "guardar como histórico (ej. si agosto es el actual, aquí va julio)."
+            )
+        else:
             try:
-                dias_ok_h, dias_omitidos_h = procesar_carga_horizontal_historica(
-                    df_hist_horizontal, producto_hist_horizontal,
-                    int(mes_hist_horizontal), int(anio_hist_horizontal), df_referencia_hist,
-                )
-            except ValueError as exc:
-                st.error(str(exc))
-                dias_ok_h, dias_omitidos_h = 0, []
+                df_hist_horizontal = leer_excel_seguro(archivo_hist_horizontal)
+            except Exception as exc:  # noqa: BLE001 - se informa al usuario cualquier error de lectura
+                st.error(f"No se pudo leer el archivo: {exc}")
+                df_hist_horizontal = None
 
-            if dias_ok_h > 0:
-                mensaje_h = (
-                    f"Se guardó el histórico diario de {producto_hist_horizontal} para "
-                    f"{int(mes_hist_horizontal)}/{int(anio_hist_horizontal)} ({dias_ok_h} día(s)). "
-                    "Los datos del mes en curso NO se modificaron."
-                )
-                if dias_omitidos_h:
-                    mensaje_h += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos_h))}."
-                st.success(mensaje_h)
+            if df_hist_horizontal is not None:
+                try:
+                    dias_ok_h, dias_omitidos_h = procesar_carga_horizontal_historica(
+                        df_hist_horizontal, producto_hist_horizontal,
+                        int(mes_hist_horizontal), int(anio_hist_horizontal), df_referencia_hist,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    dias_ok_h, dias_omitidos_h = 0, []
+
+                if dias_ok_h > 0:
+                    mensaje_h = (
+                        f"Se guardó el histórico diario de {producto_hist_horizontal} para "
+                        f"{int(mes_hist_horizontal)}/{int(anio_hist_horizontal)} ({dias_ok_h} día(s)). "
+                        "Los datos del mes en curso NO se modificaron."
+                    )
+                    if dias_omitidos_h:
+                        mensaje_h += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos_h))}."
+                    st.success(mensaje_h)
+
+    st.markdown("---")
+    with st.expander("🗑️ Borrar TODOS los datos (reiniciar la app desde cero)"):
+        st.warning(
+            "Esto borra TODO lo publicado: el mes actual, el histórico de meses anteriores, "
+            "el detalle diario y los datos de visitas del BO. No se puede deshacer. Úsalo solo "
+            "si quieres empezar de cero (por ejemplo, para hacer pruebas limpias)."
+        )
+        confirmar_borrado = st.checkbox("Sí, entiendo que esto borra todo y no se puede deshacer", key="confirmar_borrado_total")
+        if st.button("🗑️ Borrar todo y reiniciar", disabled=not confirmar_borrado):
+            archivos_a_borrar = [DATA_FILE, DATA_META, VISITAS_FILE, HISTORIAL_DIARIO_FILE]
+            borrados = []
+            for ruta in archivos_a_borrar:
+                if os.path.exists(ruta):
+                    os.remove(ruta)
+                    borrados.append(os.path.basename(ruta))
+            if os.path.isdir(HISTORICO_DIR):
+                for nombre_archivo in os.listdir(HISTORICO_DIR):
+                    os.remove(os.path.join(HISTORICO_DIR, nombre_archivo))
+                borrados.append("historico/*")
+            _leer_excel_publicado.clear()
+            _leer_historial_diario_cacheado.clear()
+            generar_datos_ejemplo.clear()
+            st.success(f"Listo, se borró todo: {', '.join(borrados) if borrados else '(no había nada que borrar)'}. Recarga la página.")
 
 
 # =============================================================================
@@ -2788,42 +2820,66 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     st.markdown("#### 📈 Ventas diarias")
 
     producto_base_grafico = producto_base_para_rango(productos_sel)
+    anio_ant_grafico, mes_ant_grafico = (anio - 1, 12) if mes == 1 else (anio, mes - 1)
+    NOMBRES_MES_REV = {7: "Julio", 8: "Agosto", 9: "Setiembre", 1: "Enero", 2: "Febrero", 3: "Marzo",
+                        4: "Abril", 5: "Mayo", 6: "Junio", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
+    nombre_mes_actual = NOMBRES_MES_REV.get(mes, str(mes))
+    nombre_mes_anterior = NOMBRES_MES_REV.get(mes_ant_grafico, str(mes_ant_grafico))
+    periodo_actual = f"{nombre_mes_actual} {anio}"
+    periodo_anterior = f"{nombre_mes_anterior} {anio_ant_grafico}"
+
     st.caption(
         f"Muestra **{producto_base_grafico}** (si tienes los 4 productos elegidos, se grafica Prepago por "
-        "defecto — elige un solo producto distinto arriba para ver ese en su lugar). Se arma a partir de "
-        "lo que se suma en cada publicación del admin: necesita al menos 2 publicaciones en días distintos "
-        "dentro del mes para verse; con 1 sola carga no hay 'diario' que graficar."
+        "defecto — elige un solo producto distinto arriba para ver ese en su lugar), comparando **día del mes** "
+        f"contra el mismo día del mes anterior ({periodo_actual} vs {periodo_anterior}, línea punteada) — no "
+        "fecha calendario, para poder superponer ambos meses. Se arma a partir de lo que se suma en cada "
+        "publicación del admin: necesita al menos 2 publicaciones en días distintos para verse."
     )
 
     historial = obtener_historial_diario()
-    if not historial.empty:
-        historial_mes = historial[
-            (historial["Fecha"].dt.year == anio) & (historial["Fecha"].dt.month == mes)
-            & (historial["Departamento"].isin(departamentos_activos))
-            & (historial["Producto"] == producto_base_grafico)
-        ]
-    else:
-        historial_mes = historial
+    col_grupo = "Departamento" if agrupar_por == "Departamento" else "Nombre"
 
-    if historial_mes.empty:
-        st.info("Todavía no hay suficientes publicaciones registradas este mes para graficar ventas diarias.")
+    def _filtrar_mes(hist, m, a):
+        if hist.empty:
+            return hist
+        return hist[
+            (hist["Fecha"].dt.year == a) & (hist["Fecha"].dt.month == m)
+            & (hist["Departamento"].isin(departamentos_activos))
+            & (hist["Producto"] == producto_base_grafico)
+        ]
+
+    historial_actual = _filtrar_mes(historial, mes, anio)
+    historial_anterior = _filtrar_mes(historial, mes_ant_grafico, anio_ant_grafico)
+
+    if historial_actual.empty and historial_anterior.empty:
+        st.info("Todavía no hay suficientes publicaciones registradas para graficar ventas diarias.")
     else:
-        historial_mes = historial_mes.copy()
-        col_grupo = "Departamento" if agrupar_por == "Departamento" else "Nombre"
-        datos_grafico = (
-            historial_mes.groupby(["Fecha", col_grupo], as_index=False)["Avance"].sum()
-        )
+        piezas = []
+        if not historial_actual.empty:
+            datos_actual = historial_actual.groupby(["Fecha", col_grupo], as_index=False)["Avance"].sum()
+            datos_actual["Día"] = datos_actual["Fecha"].dt.day
+            datos_actual["Periodo"] = periodo_actual
+            piezas.append(datos_actual)
+        if not historial_anterior.empty:
+            datos_anterior = historial_anterior.groupby(["Fecha", col_grupo], as_index=False)["Avance"].sum()
+            datos_anterior["Día"] = datos_anterior["Fecha"].dt.day
+            datos_anterior["Periodo"] = periodo_anterior
+            piezas.append(datos_anterior)
+
+        datos_grafico = pd.concat(piezas, ignore_index=True)
         datos_grafico = datos_grafico.rename(columns={col_grupo: agrupar_por})
 
         grafico = (
             alt.Chart(datos_grafico)
-            .mark_line(strokeWidth=3.5, point=alt.OverlayMarkDef(size=45))
+            .mark_line(strokeWidth=3.5, point=alt.OverlayMarkDef(size=40))
             .encode(
-                x=alt.X("Fecha:T", title="Fecha", axis=alt.Axis(format="%d/%m", labelAngle=0)),
+                x=alt.X("Día:O", title="Día del mes"),
                 y=alt.Y("Avance:Q", title=f"Venta diaria ({producto_base_grafico})", scale=alt.Scale(zero=True)),
                 color=alt.Color(f"{agrupar_por}:N", title=agrupar_por),
+                strokeDash=alt.StrokeDash("Periodo:N", title="Periodo", sort=[periodo_actual, periodo_anterior]),
                 tooltip=[
-                    alt.Tooltip("Fecha:T", title="Fecha", format="%d/%m/%Y"),
+                    alt.Tooltip("Periodo:N", title="Periodo"),
+                    alt.Tooltip("Día:O", title="Día"),
                     alt.Tooltip(f"{agrupar_por}:N", title=agrupar_por),
                     alt.Tooltip("Avance:Q", title="Venta", format=",.0f"),
                 ],
@@ -2831,6 +2887,11 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
             .properties(height=420)
         )
         st.altair_chart(grafico, width="stretch")
+        if historial_anterior.empty:
+            st.caption(
+                f"Solo se ve {periodo_actual} — todavía no hay detalle diario de {periodo_anterior} "
+                "(cárgalo en el panel admin, sección 'Cargar ventas diarias de un MES ANTERIOR')."
+            )
         st.caption(f"Ventas registradas por publicación, agrupadas por {agrupar_por.lower()} — no es un conteo transaccional día por día, sino lo sumado en cada carga del admin.")
 
 
