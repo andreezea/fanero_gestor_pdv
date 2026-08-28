@@ -2963,14 +2963,23 @@ def vista_gerencial(df: pd.DataFrame, dias_en_mes: int, dia_corte: int, mes: int
     historial = obtener_historial_diario()
     col_grupo = "Departamento" if agrupar_por == "Departamento" else "Nombre"
 
+    # PDV que quedaron en `df` después de TODOS los filtros de esta vista
+    # (Departamento, DNI del líder/PDV, Provincia, Distrito) — se usan para
+    # que el gráfico respete exactamente lo mismo que la tabla de arriba,
+    # no solo Departamento y Producto.
+    pdvs_en_alcance = set(df["PDV"].unique())
+
     def _filtrar_mes(hist, m, a):
         if hist.empty:
             return hist
-        return hist[
+        filtro = (
             (hist["Fecha"].dt.year == a) & (hist["Fecha"].dt.month == m)
             & (hist["Departamento"].isin(departamentos_activos))
             & (hist["Producto"] == producto_base_grafico)
-        ]
+        )
+        if "PDV" in hist.columns:
+            filtro = filtro & (hist["PDV"].isin(pdvs_en_alcance))
+        return hist[filtro]
 
     historial_actual = _filtrar_mes(historial, mes, anio)
     historial_anterior = _filtrar_mes(historial, mes_ant_grafico, anio_ant_grafico)
