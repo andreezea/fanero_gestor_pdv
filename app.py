@@ -2150,6 +2150,12 @@ def panel_admin() -> None:
                     if dias_omitidos:
                         mensaje += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos))}."
                     st.success(mensaje)
+                elif dias_omitidos:
+                    st.warning(
+                        f"⚠️ No se guardó nada: las {len(dias_omitidos)} columna(s) de día encontradas "
+                        "estaban vacías o con valores no numéricos para todos los PDV. Revisa que las celdas "
+                        "tengan números, no texto ni fórmulas rotas."
+                    )
 
     with st.expander("📅➕ Cargar ventas diarias de un MES ANTERIOR (histórico)"):
         st.caption(
@@ -2230,6 +2236,38 @@ def panel_admin() -> None:
                         if dias_omitidos_h:
                             mensaje_h += f" Días sin datos (omitidos): {', '.join(map(str, dias_omitidos_h))}."
                         st.success(mensaje_h)
+                    elif dias_omitidos_h:
+                        st.warning(
+                            f"⚠️ No se guardó nada para {producto_hist_horizontal} "
+                            f"{int(mes_hist_horizontal)}/{int(anio_hist_horizontal)}: las columnas de día "
+                            "quedaron vacías para todos los PDV. Revisa: (1) que las celdas tengan números, "
+                            "no texto; (2) si marcaste un filtro de Departamento arriba, que coincida "
+                            "exactamente con lo que trae el archivo (si no coincide nada, el archivo queda "
+                            "vacío después de filtrar y no hay nada que guardar)."
+                        )
+
+    with st.expander("📊 Ver qué detalle diario hay guardado (diagnóstico)"):
+        st.caption(
+            "Muestra exactamente qué meses/productos tienen detalle diario guardado, cuántas filas y "
+            "el total de Avance — para verificar que una carga sí se guardó, sin adivinar."
+        )
+        historial_diag = obtener_historial_diario()
+        if historial_diag.empty:
+            st.info("Todavía no hay ningún detalle diario guardado (ni del mes actual ni de meses anteriores).")
+        else:
+            historial_diag = historial_diag.copy()
+            historial_diag["Mes/Año"] = historial_diag["Fecha"].dt.strftime("%m/%Y")
+            resumen_diag = (
+                historial_diag.groupby(["Mes/Año", "Producto"], as_index=False)
+                .agg(
+                    Departamentos=("Departamento", lambda s: ", ".join(sorted(s.unique()))),
+                    Filas=("Avance", "count"),
+                    Días_distintos=("Fecha", "nunique"),
+                    Avance_total=("Avance", "sum"),
+                )
+                .sort_values(["Mes/Año", "Producto"])
+            )
+            st.dataframe(resumen_diag, width="stretch", hide_index=True)
 
     with st.expander("🔧 Recalcular Avance desde el historial diario (recuperación)"):
         st.info(
