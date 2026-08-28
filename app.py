@@ -623,15 +623,27 @@ def registrar_incremento_diario(df_incremento: pd.DataFrame, fecha: "pd.Timestam
     registrar_incrementos_diarios_lote([(df_incremento, fecha)])
 
 
+@st.cache_data
+def _leer_historial_diario_cacheado(path: str, mtime: float) -> pd.DataFrame:
+    """Lee el historial diario. `mtime` forma parte de la clave de cache: si
+    el archivo no cambió desde la última carga, no se vuelve a leer del
+    disco — esto es clave porque este archivo crece con cada publicación y
+    se consulta en cada re-render de Vista Gerencial (para el gráfico de
+    Ventas diarias y las comparaciones M0/M-1), sin cache se vuelve lento a
+    medida que crecen los datos reales."""
+    df = leer_excel_seguro(path, parse_dates=["Fecha"])
+    df["DNI"] = df["DNI"].astype(str).str.strip()
+    return df
+
+
 def obtener_historial_diario() -> pd.DataFrame:
     """Devuelve el historial completo de incrementos diarios (Fecha, DNI,
     Nombre, Departamento, Producto, Avance), o una tabla vacía si aún no
     hay ninguna publicación registrada."""
     if os.path.exists(HISTORIAL_DIARIO_FILE):
         try:
-            df = leer_excel_seguro(HISTORIAL_DIARIO_FILE, parse_dates=["Fecha"])
-            df["DNI"] = df["DNI"].astype(str).str.strip()
-            return df
+            mtime = os.path.getmtime(HISTORIAL_DIARIO_FILE)
+            return _leer_historial_diario_cacheado(HISTORIAL_DIARIO_FILE, mtime)
         except Exception:  # noqa: BLE001 - archivo corrupto
             pass
     return pd.DataFrame(columns=["Fecha", "DNI", "Nombre", "Departamento", "Producto", "Avance"])
