@@ -2251,6 +2251,13 @@ def panel_admin() -> None:
             "Muestra exactamente qué meses/productos tienen detalle diario guardado, cuántas filas y "
             "el total de Avance — para verificar que una carga sí se guardó, sin adivinar."
         )
+        if st.button("🔄 Forzar actualización (limpiar caché y releer todo)"):
+            _leer_excel_publicado.clear()
+            _leer_historial_diario_cacheado.clear()
+            generar_datos_ejemplo.clear()
+            st.success("Caché limpiada. La tabla de abajo y toda la app usan datos frescos del disco.")
+            st.rerun()
+
         historial_diag = obtener_historial_diario()
         if historial_diag.empty:
             st.info("Todavía no hay ningún detalle diario guardado (ni del mes actual ni de meses anteriores).")
@@ -2268,6 +2275,34 @@ def panel_admin() -> None:
                 .sort_values(["Mes/Año", "Producto"])
             )
             st.dataframe(resumen_diag, width="stretch", hide_index=True)
+
+            st.markdown("**🗑️ Borrar entradas específicas del historial diario**")
+            st.caption(
+                "Elige una o varias combinaciones Mes/Año + Producto que NO deberían estar ahí (por "
+                "ejemplo, agosto cargado por error como si fuera un mes anterior) y bórralas — no afecta "
+                "el resto del historial ni los datos del mes en curso publicados."
+            )
+            opciones_borrado = [f"{fila['Mes/Año']} · {fila['Producto']}" for _, fila in resumen_diag.iterrows()]
+            seleccion_borrado = st.multiselect(
+                "Combinaciones Mes/Año + Producto a borrar", options=opciones_borrado, default=[], key="seleccion_borrado_historial",
+            )
+            confirmar_borrado_historial = st.checkbox(
+                "Sí, entiendo que esto borra esas entradas del historial diario y no se puede deshacer",
+                key="confirmar_borrado_historial",
+            )
+            if st.button("🗑️ Borrar seleccionado", disabled=not (seleccion_borrado and confirmar_borrado_historial)):
+                historial_actual_borrado = obtener_historial_diario().copy()
+                historial_actual_borrado["Mes/Año"] = historial_actual_borrado["Fecha"].dt.strftime("%m/%Y")
+                historial_actual_borrado["_Clave"] = historial_actual_borrado["Mes/Año"] + " · " + historial_actual_borrado["Producto"]
+                queda_historial_borrado = historial_actual_borrado[~historial_actual_borrado["_Clave"].isin(seleccion_borrado)]
+                queda_historial_borrado = queda_historial_borrado.drop(columns=["Mes/Año", "_Clave"])
+                if queda_historial_borrado.empty:
+                    os.remove(HISTORIAL_DIARIO_FILE)
+                else:
+                    queda_historial_borrado.to_excel(HISTORIAL_DIARIO_FILE, index=False)
+                _leer_historial_diario_cacheado.clear()
+                st.success(f"Se borraron {len(seleccion_borrado)} combinación(es) del historial diario: {', '.join(seleccion_borrado)}.")
+                st.rerun()
 
     with st.expander("🔧 Recalcular Avance desde el historial diario (recuperación)"):
         st.info(
