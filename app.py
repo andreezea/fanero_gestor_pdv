@@ -369,7 +369,12 @@ def generar_datos_ejemplo(n_gestores: int = 40, seed: int = 42) -> pd.DataFrame:
 
 def cargar_datos_excel(archivo) -> pd.DataFrame | None:
     """Lee y valida un archivo Excel cargado por el administrador.
-    Retorna None (y muestra un error en la UI) si faltan columnas requeridas."""
+    Retorna None (y muestra un error en la UI) si faltan columnas requeridas.
+
+    "Avance" es la única columna opcional: si el archivo no la trae (por
+    ejemplo, una plantilla armada solo para actualizar Cuota), se completa
+    con 0 automáticamente — así es imposible que sumar Avance por
+    accidente al recargar la cartera de un gestor."""
     try:
         if hasattr(archivo, "seek"):
             archivo.seek(0)  # por si ya se leyó antes (ej. para la vista previa)
@@ -378,10 +383,14 @@ def cargar_datos_excel(archivo) -> pd.DataFrame | None:
         st.error(f"No se pudo leer el archivo Excel: {exc}")
         return None
 
-    faltantes = COLUMNAS_REQUERIDAS - set(df.columns)
+    faltantes = (COLUMNAS_REQUERIDAS - {"Avance"}) - set(df.columns)
     if faltantes:
         st.error("El archivo no contiene las columnas requeridas: " + ", ".join(sorted(faltantes)))
         return None
+
+    if "Avance" not in df.columns:
+        df["Avance"] = 0
+        st.info("ℹ️ Este archivo no trae la columna 'Avance' — se completó con 0 automáticamente (solo actualiza Cuota).")
 
     return _normalizar_identidad(df)
 
@@ -1845,12 +1854,24 @@ def panel_admin() -> None:
     st.header("🔒 Panel administrador")
     st.success("Sesión de administrador activa.")
 
-    st.download_button(
-        "📥 Plantilla de carga",
-        data=generar_plantilla_excel(),
-        file_name="plantilla_carga_gestores.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    col_plantilla1, col_plantilla2 = st.columns(2)
+    with col_plantilla1:
+        st.download_button(
+            "📥 Plantilla de carga (Cuota + Avance)",
+            data=generar_plantilla_excel(),
+            file_name="plantilla_carga_gestores.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with col_plantilla2:
+        st.download_button(
+            "📥 Plantilla SOLO CUOTA (sin Avance)",
+            data=generar_plantilla_solo_cuota_excel(),
+            file_name="plantilla_solo_cuota.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Úsala para agregar o actualizar la cartera/cuota de un gestor sin ningún riesgo de "
+                 "afectar sus ventas ya cargadas — no tiene columna Avance, así que no hay forma de "
+                 "sumarle nada por accidente.",
+        )
 
     departamentos_disponibles_admin = sorted(GEOGRAFIA.keys())
     if os.path.exists(DATA_FILE):
@@ -2266,6 +2287,47 @@ def generar_plantilla_excel() -> bytes:
     dv_producto.add(f"H2:H{ultima_fila}")
 
     anchos = {"A": 12, "B": 22, "C": 16, "D": 18, "E": 18, "F": 12, "G": 18, "H": 12, "I": 10, "J": 10}
+    for col, ancho in anchos.items():
+        ws.column_dimensions[col].width = ancho
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def generar_plantilla_solo_cuota_excel() -> bytes:
+    """Como `generar_plantilla_excel`, pero SIN la columna Avance — pensada
+    para actualizar/agregar solo Cuotas (ej. la cartera completa de un
+    gestor) sin ningún riesgo de sumar u afectar ventas ya cargadas."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cuotas"
+
+    headers = ["DNI", "Nombre", "Departamento", "Provincia", "Distrito", "PDV", "Nombre PDV", "Producto", "Cuota"]
+    ws.append(headers)
+
+    ejemplos = [
+        ["87654321", "Rosa Huamán", "San Martín", "San Martín", "Tarapoto", "71234567", "Ana Ruiz", "Prepago", 180],
+        ["87654321", "Rosa Huamán", "San Martín", "San Martín", "Tarapoto", "76543210", "Luis Gómez", "Prepago", 120],
+        ["87654321", "Rosa Huamán", "San Martín", "San Martín", "Tarapoto", "71234567", "Ana Ruiz", "Postpago", 60],
+    ]
+    for fila in ejemplos:
+        ws.append(fila)
+
+    ultima_fila = 1000
+    dv_departamento = DataValidation(type="list", formula1='"' + ",".join(DEPARTAMENTOS) + '"', allow_blank=True)
+    dv_provincia = DataValidation(type="list", formula1='"' + ",".join(TODAS_LAS_PROVINCIAS) + '"', allow_blank=True)
+    dv_producto = DataValidation(type="list", formula1='"' + ",".join(PRODUCTOS) + '"', allow_blank=True)
+
+    ws.add_data_validation(dv_departamento)
+    ws.add_data_validation(dv_provincia)
+    ws.add_data_validation(dv_producto)
+
+    dv_departamento.add(f"C2:C{ultima_fila}")
+    dv_provincia.add(f"D2:D{ultima_fila}")
+    dv_producto.add(f"H2:H{ultima_fila}")
+
+    anchos = {"A": 12, "B": 22, "C": 16, "D": 18, "E": 18, "F": 12, "G": 18, "H": 12, "I": 10}
     for col, ancho in anchos.items():
         ws.column_dimensions[col].width = ancho
 
